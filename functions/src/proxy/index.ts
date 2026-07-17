@@ -12,6 +12,7 @@
  * absent, the proxy injects the right one (generated code stays simple).
  */
 import { onRequest } from 'firebase-functions/v2/https';
+import type { Response } from 'express';
 import { db } from '../lib/admin.js';
 import { bearerToken, requireFirebaseUser } from '../lib/authn.js';
 import { HL_CLIENT_SECRET, PREVIEW_TOKEN_SECRET } from '../config.js';
@@ -48,6 +49,42 @@ function hlPathFromRequest(path: string): string {
   const idx = path.indexOf('/hlProxy');
   const p = idx >= 0 ? path.slice(idx + '/hlProxy'.length) : path;
   return p === '' ? '/' : p;
+}
+
+/**
+ * Serve recent HL webhook events for a location from Firestore (written by the
+ * hlWebhook receiver). `since` is an ISO timestamp; only later events return, so
+ * the generated app can poll incrementally. Capped so a poll stays cheap.
+ */
+async function serveWebhookEvents(
+  res: Response,
+  locationId: string,
+  sinceRaw: unknown,
+): Promise<void> {
+  const since = typeof sinceRaw === 'string' ? new Date(sinceRaw) : null;
+  const sinceDate = since && !isNaN(since.getTime()) ? since : new Date(0);
+
+  const snap = await db
+    .collection('webhookEvents')
+    .doc(locationId)
+    .collection('events')
+    .where('receivedAt', '>', sinceDate)
+    .orderBy('receivedAt', 'asc')
+    .limit(50)
+    .get();
+
+  const events = snap.docs.map((d) => {
+    const data = d.data();
+    const ts = data.receivedAt as { toDate?: () => Date } | undefined;
+    return {
+      id: d.id,
+      type: data.type ?? 'Unknown',
+      data: data.data ?? {},
+      receivedAt: ts?.toDate ? ts.toDate().toISOString() : new Date(0).toISOString(),
+    };
+  });
+
+  res.json({ events });
 }
 
 export const hlProxy = onRequest(
@@ -89,18 +126,9 @@ export const hlProxy = onRequest(
       }
     }
 
-    // --- Allowlist gate (before any token work). ---
     const hlPath = hlPathFromRequest(req.path);
-    const rule = matchRule(req.method, hlPath);
-    if (!rule) {
-      res.status(403).json({
-        error: `Endpoint not allowed: ${req.method} ${hlPath}`,
-        hint: 'The Genesis proxy exposes a fixed allowlist of HighLevel endpoints.',
-      });
-      return;
-    }
 
-    // --- Resolve + enforce location scoping. ---
+    // --- Resolve the caller's location (from the token, never the request). ---
     if (tokenLocationId === null) {
       const user = await db.collection('users').doc(uid).get();
       const hl = user.data()?.hl as { locationId?: string } | undefined;
@@ -111,6 +139,26 @@ export const hlProxy = onRequest(
       return;
     }
 
+    // --- Genesis-internal route: live HL webhook events for this location. ---
+    // Not forwarded to HL — served from Firestore (written by the hlWebhook
+    // receiver). Lets a sandboxed generated app react to events using only its
+    // capability token, with no direct database access. GET /__events?since=<ISO>
+    if (req.method === 'GET' && hlPath === '/__events') {
+      await serveWebhookEvents(res, tokenLocationId, req.query.since);
+      return;
+    }
+
+    // --- Allowlist gate (before any token work). ---
+    const rule = matchRule(req.method, hlPath);
+    if (!rule) {
+      res.status(403).json({
+        error: `Endpoint not allowed: ${req.method} ${hlPath}`,
+        hint: 'The Genesis proxy exposes a fixed allowlist of HighLevel endpoints.',
+      });
+      return;
+    }
+
+    // --- Enforce location scoping. ---
     const query: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.query)) {
       if (typeof v === 'string') query[k] = v;

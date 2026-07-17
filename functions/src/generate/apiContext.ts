@@ -26,6 +26,29 @@ Make every data request like this (note: DO NOT send locationId — the proxy ad
 Always handle loading, empty, and error states. If window.__GENESIS__ is undefined
 (app opened outside the preview), show a friendly "Connect HighLevel in Genesis" message.
 
+## Realtime HighLevel events (optional — use when the app should react live)
+
+The runtime also provides \`window.__GENESIS__.onWebhook(handler)\` — a live feed of
+HighLevel webhook events for this location (e.g. a contact created, an inbound
+message, an appointment booked). Use it to auto-refresh a list or show a toast
+when something happens, instead of only loading data once.
+
+    const G = window.__GENESIS__;
+    if (G && G.onWebhook) {
+      const unsubscribe = G.onWebhook((event) => {
+        // event = { type: string, data: object, receivedAt: ISO string }
+        if (event.type === 'ContactCreate') {
+          reloadContacts();           // e.g. re-run your /contacts/search
+        }
+      });
+      // call unsubscribe() on teardown if you need to stop listening
+    }
+
+Common event \`type\` values: "ContactCreate", "ContactUpdate", "ContactDelete",
+"InboundMessage", "OutboundMessage", "AppointmentCreate", "AppointmentUpdate".
+\`event.data\` is the raw HighLevel payload for that event. Always feature-detect
+\`G.onWebhook\` (it's only present when HighLevel is connected).
+
 ## Allowlisted endpoints (these are the ONLY ones available through the proxy)
 
 CONTACTS

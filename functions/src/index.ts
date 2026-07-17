@@ -21,6 +21,8 @@ export { mintPreviewToken, hlProxy } from './proxy/index.js';
 export { generate } from './generate/index.js';
 // Snapshot restore (version control)
 export { restoreSnapshot } from './generate/restore.js';
+// HighLevel webhook receiver — stores events for generated apps to react to
+export { hlWebhook } from './webhooks/index.js';
 
 /** Simple liveness probe. */
 export const health = onRequest({ cors: true }, (_req, res) => {

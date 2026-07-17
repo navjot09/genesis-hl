@@ -76,6 +76,60 @@ export function buildPreviewHtml(
   // app uses its demo fallback). JSON.stringify keeps the token out of the way
   // of any accidental </script> in content.
   const envJson = env ? JSON.stringify(env) : 'undefined'
-  const bridge = `<script>window.__GENESIS__ = ${envJson};</script>`
-  return injectIntoHead(html, bridge)
+  return injectIntoHead(html, buildBridge(envJson))
+}
+
+/**
+ * The runtime injected into every preview. Exposes `window.__GENESIS__` with the
+ * proxy URL + capability token, plus `onWebhook(handler)` — a realtime feed of
+ * live HighLevel events (new contact, inbound message, …) polled from the
+ * proxy's Genesis-internal /__events route. Generated apps just register a
+ * handler; the polling loop lives here so the generated code stays trivial.
+ */
+function buildBridge(envJson: string): string {
+  return `<script>
+(function () {
+  var env = ${envJson};
+  window.__GENESIS__ = env;
+  if (!env || !env.proxyUrl || !env.token) return;
+
+  var handlers = [];
+  // Only surface events that arrive AFTER this preview loads.
+  var since = new Date().toISOString();
+  var timer = null;
+
+  async function poll() {
+    try {
+      var res = await fetch(
+        env.proxyUrl + '/__events?since=' + encodeURIComponent(since),
+        { headers: { Authorization: 'Bearer ' + env.token } }
+      );
+      if (res.ok) {
+        var body = await res.json();
+        var events = (body && body.events) || [];
+        if (events.length) {
+          since = events[events.length - 1].receivedAt || since;
+          events.forEach(function (ev) {
+            handlers.forEach(function (h) {
+              try { h(ev); } catch (_) {}
+            });
+          });
+        }
+      }
+    } catch (_) { /* transient — try again next tick */ }
+    timer = setTimeout(poll, 5000);
+  }
+
+  env.onWebhook = function (handler) {
+    if (typeof handler !== 'function') return function () {};
+    handlers.push(handler);
+    if (timer === null) timer = setTimeout(poll, 1500);
+    // returns an unsubscribe fn
+    return function () {
+      var i = handlers.indexOf(handler);
+      if (i >= 0) handlers.splice(i, 1);
+    };
+  };
+})();
+</script>`
 }

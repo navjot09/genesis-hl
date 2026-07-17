@@ -42,6 +42,12 @@ a sandboxed preview, and every generation is captured as a restorable snapshot.
 5. Create a **sandbox test account** (Developer Portal → Testing → Create App Test Account), add a
    **sub-account/location** to it, and seed a few contacts / a conversation / a calendar so the preview
    has real data.
+6. **(Optional) Webhooks** — to let generated apps react to live events, register the webhook URL and
+   subscribe to events in the marketplace app:
+   - Webhook URL: `https://us-central1-genesis-hl.cloudfunctions.net/hlWebhook`
+   - Subscribe to e.g. `ContactCreate`, `ContactUpdate`, `InboundMessage`, `AppointmentCreate`.
+   HL POSTs each event here; the generated app receives it in the preview via
+   `window.__GENESIS__.onWebhook(handler)` (see [Architecture decisions](#architecture-decisions)).
 
 **API notes worth knowing** (all discovered against live HL, baked into the generation prompt):
 - Base host `services.leadconnectorhq.com`. **`Version` header differs per module** — Contacts
@@ -104,6 +110,12 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
 - **Immutable snapshots + mutable working set.** Firestore's 1MB/doc limit means files are one-doc-each
   under `projects/{id}/snapshots/{sid}/files/{fid}`. Snapshots are immutable; **restore is append-only**
   (a new snapshot), so the timeline never branches and restores are themselves undoable.
+- **Live HL webhooks, without exposing the database to the preview.** A public `hlWebhook` receiver
+  stores each HighLevel event under `webhookEvents/{locationId}`; the generated app reads them through
+  the *same* proxy + capability token it already uses (a Genesis-internal `/__events` route, not
+  forwarded to HL). The injected runtime exposes `window.__GENESIS__.onWebhook(handler)` — the polling
+  loop lives in the bridge, so generated code just registers a handler and the sandboxed iframe never
+  touches Firestore directly. (Signature verification of HL's payload is the next hardening step.)
 - **Automatic continuation on interruption.** Generation keeps every completed `<file>` and resumes from
   a clean boundary on a mid-stream drop / `max_tokens` / RECITATION — partial results are always
   preserved in a snapshot with a clear message. (Discovered the local network resets Gemini streams at
@@ -116,7 +128,8 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
 - **Durable generation jobs.** Today the SSE request *is* the job; make generation a background job so a
   dropped client can reconnect and resume, with a queue for concurrency.
 - **Rate limiting + abuse controls** on the generation and proxy endpoints (per-user quotas, token
-  budgets), plus HL **webhook** support so generated apps can react to events.
+  budgets), and **verifying HL's webhook signature** on the `hlWebhook` receiver (today it accepts and
+  stores; production should validate HL's RSA-signed payload and drop unrecognised locations).
 - **Richer, versioned HL API context** for the model (dynamic per-request scoping and a larger, tested
   reference) instead of a curated static prompt — reduces shape-mismatch bugs like the nested messages one.
 - **Hardening:** encrypt HL tokens at rest (KMS), a scheduled proactive token-refresh cron, a strict CSP,
@@ -153,7 +166,8 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
 /functions          Firebase Cloud Functions (TypeScript, ESM)
   src/oauth/         OAuth start + callback + authenticated complete (CSRF-safe)
   src/hl/            token store (locked rotating refresh) + HL client + API constants
-  src/proxy/         preview capability tokens + endpoint allowlist + /hlProxy
+  src/proxy/         preview capability tokens + endpoint allowlist + /hlProxy + /__events feed
+  src/webhooks/      hlWebhook receiver — stores HL events per location for generated apps
   src/generate/      SSE endpoint, marker parser, Zod validation, snapshots, edit apply, diffs, restore
   src/llm/           provider-agnostic interface + Gemini adapter
 /frontend           Vue 3 + ShadCN SPA (3-panel: chat | Monaco editor | live preview)
