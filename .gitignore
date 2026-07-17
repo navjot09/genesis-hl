@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+frontend/dist/
+functions/lib/
+*.tsbuildinfo
+
+# Secrets & env — NEVER commit these (only .env.example is tracked)
+.env
+.env.*
+!.env.example
+**/.secret.local
+**/serviceAccount*.json
+**/*service-account*.json
+
+# Firebase
+.firebase/
+*-debug.log
+firebase-export-*/
+emulator-data/
+
+# Local dev logs
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

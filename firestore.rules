@@ -1,0 +1,90 @@
+rules_version = '2';
+
+// Genesis Firestore security rules.
+//
+// Model:
+//   users/{uid}                                  — app user profile + SAFE HighLevel connection metadata
+//                                                  (connected, locationId, locationName). Client can READ
+//                                                  its own doc (dashboard status) but never write it.
+//   hlTokens/{uid}                               — HL OAuth access/refresh tokens. BACKEND-ONLY: no match
+//                                                  rule exists, so the catch-all deny blocks every client
+//                                                  read/write. Kept out of users/{uid} so the readable
+//                                                  profile can never leak tokens.
+//   projects/{projectId}                         — owned by a single Firebase user (ownerUid).
+//   projects/{projectId}/files/{fileId}          — the current, MUTABLE working file set (editor + preview).
+//                                                  Client may read/write (manual edits) if it owns the project.
+//   projects/{projectId}/messages/{messageId}    — chat history. Client may read + create its own 'user'
+//                                                  messages; assistant messages are written by the backend.
+//   projects/{projectId}/snapshots/{snapshotId}  — IMMUTABLE point-in-time copies (version control).
+//   projects/{projectId}/snapshots/{sid}/files/  — immutable file copies for that snapshot.
+//                                                  Snapshots are written ONLY by the backend.
+//   oauthStates/{state}                          — CSRF/join records for the OAuth flow. Backend only.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function projectOwner(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)).data.ownerUid;
+    }
+
+    function ownsProject(projectId) {
+      return isSignedIn() && projectOwner(projectId) == request.auth.uid;
+    }
+
+    // --- Users -------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow write: if false; // tokens & profile written by backend (Admin SDK) only
+    }
+
+    // --- Projects ----------------------------------------------------------
+    match /projects/{projectId} {
+      allow read: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+                    && request.resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.deletedAt == null;
+      allow update: if isSignedIn()
+                    && resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.ownerUid == request.auth.uid;
+      allow delete: if false; // soft-delete only: set deletedAt via update
+
+      // Current working files — client-editable by the owner (manual edits).
+      match /files/{fileId} {
+        allow read, write: if ownsProject(projectId);
+      }
+
+      // Chat history — owner reads; owner may append its own user messages.
+      match /messages/{messageId} {
+        allow read: if ownsProject(projectId);
+        allow create: if ownsProject(projectId)
+                      && request.resource.data.role == 'user';
+        allow update, delete: if false;
+      }
+
+      // Snapshots — immutable, backend-written; owner may read.
+      match /snapshots/{snapshotId} {
+        allow read: if ownsProject(projectId);
+        allow write: if false;
+
+        match /files/{fileId} {
+          allow read: if ownsProject(projectId);
+          allow write: if false;
+        }
+      }
+    }
+
+    // --- OAuth state (backend only) ---------------------------------------
+    match /oauthStates/{state} {
+      allow read, write: if false;
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

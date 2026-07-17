@@ -1,0 +1,6 @@
+{
+  "projects": {
+    "default": "genesis-hl",
+    "demo": "demo-genesis"
+  }
+}
