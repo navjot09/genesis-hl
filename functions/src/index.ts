@@ -33,8 +33,25 @@ export const health = onRequest({ cors: true }, (_req, res) => {
  * Day-1 de-risk: prove SSE streams incrementally. Emits `token` events with a
  * small delay, then `done`. Consume with fetch + ReadableStream (or curl -N).
  */
-export const sseDemo = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
+export const sseDemo = onRequest({ cors: true, timeoutSeconds: 600 }, async (req, res) => {
   const sse = startSse(res, req);
+
+  // Diagnostic mode: ?seconds=N&intervalMs=M streams a steady counter for N
+  // seconds (no LLM) to isolate pure transport behaviour from generation.
+  const seconds = Math.min(Number(req.query.seconds) || 0, 300);
+  if (seconds > 0) {
+    const intervalMs = Math.min(Math.max(Number(req.query.intervalMs) || 2000, 200), 60000);
+    const ticks = Math.floor((seconds * 1000) / intervalMs);
+    for (let i = 0; i < ticks; i++) {
+      if (sse.closed) break;
+      sse.send('token', { index: i, atMs: i * intervalMs });
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    if (!sse.closed) sse.send('done', { count: ticks });
+    sse.end();
+    return;
+  }
+
   const words =
     'the quick brown fox jumps over the lazy dog while genesis streams tokens to the browser in real time'.split(
       ' ',
