@@ -225,9 +225,19 @@ const hasContent = computed(
           <div
             class="max-w-[85%] rounded-2xl rounded-tl-sm bg-muted px-3 py-2 text-sm whitespace-pre-wrap break-words text-foreground"
           >
-            <template v-if="generation.streamingAssistant.value">{{
-              generation.streamingAssistant.value
-            }}</template>
+            <!-- Connection dropped mid-stream: the server keeps generating and
+                 saving; we're waiting for the committed result to sync back. -->
+            <template v-if="generation.finalizing.value">
+              <span class="text-muted-foreground">
+                Connection dropped — finalizing your app on the server. It’ll appear here in a
+                moment…
+              </span>
+            </template>
+            <template v-else>
+              <template v-if="generation.streamingAssistant.value">{{
+                generation.streamingAssistant.value
+              }}</template>
+            </template>
             <span class="inline-flex items-center gap-1 align-middle">
               <span class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.3s]" />
               <span class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.15s]" />

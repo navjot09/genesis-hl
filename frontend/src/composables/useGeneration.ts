@@ -11,7 +11,9 @@
  * blocks with an `event:` line and a JSON `data:` line.
  */
 import { computed, onUnmounted, reactive, ref, type InjectionKey } from 'vue'
+import { doc, getDoc, onSnapshot } from 'firebase/firestore'
 import { toast } from 'vue-sonner'
+import { db } from '@/lib/firebase'
 import { authedFetch } from '@/lib/api'
 
 export interface GenFile {
@@ -81,10 +83,17 @@ function parseEventBlock(block: string): ParsedEvent | null {
 
 export function useGeneration(projectId: string) {
   const generating = ref(false)
+  // True while a mid-stream connection drop is being reconciled: the server
+  // finishes + commits reliably even if the browser loses the SSE, so we wait
+  // for the committed result instead of failing (see recoverAfterDrop).
+  const finalizing = ref(false)
   const activePath = ref<string | null>(null)
   const streamingAssistant = ref('')
   const lastSnapshotId = ref<string | null>(null)
   const lastError = ref<string | null>(null)
+  // Set once this run receives a terminal result (snapshot/done/error) over SSE,
+  // so a later connection error isn't mistaken for a lost generation.
+  let sawResult = false
 
   // Live streamed files for the IN-PROGRESS generation, keyed by path.
   const files = reactive<Record<string, GenFile>>({})
@@ -141,12 +150,14 @@ export function useGeneration(projectId: string) {
       }
       case 'snapshot': {
         const d = data as SnapshotData
+        sawResult = true
         lastSnapshotId.value = d.snapshotId
         for (const p of Object.keys(files)) files[p].streaming = false
         break
       }
       case 'done': {
         const d = data as DoneData
+        sawResult = true
         for (const p of Object.keys(files)) files[p].streaming = false
         if (d.truncated) {
           toast.info('Generation stopped early', {
@@ -163,6 +174,7 @@ export function useGeneration(projectId: string) {
       }
       case 'error': {
         const d = data as ErrorData
+        sawResult = true
         lastError.value = d.message
         toast.error('Generation failed', {
           description: d.message + (d.partial ? ' (partial result kept)' : ''),
@@ -182,8 +194,15 @@ export function useGeneration(projectId: string) {
     if (!text || generating.value) return
 
     resetLiveState()
+    sawResult = false
+    finalizing.value = false
     generating.value = true
     controller = new AbortController()
+
+    // Snapshot pointer BEFORE we start: if the SSE drops, the server still
+    // commits and advances this id, which is how we detect the real result.
+    const baseSnapshotId = await currentSnapshotId()
+    let streamStarted = false
 
     try {
       const res = await authedFetch('/generate', {
@@ -197,6 +216,7 @@ export function useGeneration(projectId: string) {
         throw new Error(body.error ?? `Generation request failed (${res.status})`)
       }
 
+      streamStarted = true
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
@@ -226,17 +246,88 @@ export function useGeneration(projectId: string) {
         toast.info('Generation stopped', {
           description: 'Any completed files were kept.',
         })
+      } else if (streamStarted && !sawResult) {
+        // The stream dropped mid-generation (common on networks that cut
+        // long-lived connections). The server keeps running and commits the
+        // result, so wait for it rather than declaring failure.
+        await recoverAfterDrop(baseSnapshotId)
       } else {
+        // Failed before streaming began (auth / bad request / server error).
         const message = err instanceof Error ? err.message : 'Connection lost'
         lastError.value = message
-        toast.error('Generation interrupted', {
-          description: `${message} — any completed files were kept.`,
-        })
+        toast.error('Could not start generation', { description: message })
       }
     } finally {
       generating.value = false
+      finalizing.value = false
       controller = null
     }
+  }
+
+  /** Read the project's current snapshot pointer (null if none / unreadable). */
+  async function currentSnapshotId(): Promise<string | null> {
+    try {
+      const snap = await getDoc(doc(db, 'projects', projectId))
+      return (snap.data()?.currentSnapshotId as string | undefined) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * The SSE dropped mid-generation but the backend commits reliably. Wait for
+   * the project's snapshot pointer to advance (the commit signal); the editor,
+   * preview and chat then sync from their own Firestore listeners. Only surface
+   * a hard error if nothing commits within the timeout.
+   */
+  async function recoverAfterDrop(baseSnapshotId: string | null): Promise<void> {
+    finalizing.value = true
+    const toastId = toast.loading('Connection dropped — finalizing on the server…', {
+      description: 'Your app is still being generated and saved. This can take a minute or two.',
+    })
+    const committed = await waitForNewSnapshot(baseSnapshotId, 180_000)
+    if (committed) {
+      toast.success('Generation complete', {
+        id: toastId,
+        description: 'The connection dropped mid-stream, but your app finished and was saved.',
+      })
+    } else {
+      lastError.value = 'The connection dropped before the result arrived.'
+      toast.error('Generation interrupted', {
+        id: toastId,
+        description: 'The result didn’t arrive in time. Please try again.',
+      })
+    }
+    finalizing.value = false
+  }
+
+  /** Resolve true once currentSnapshotId advances past `base`, else false on timeout/stop. */
+  function waitForNewSnapshot(base: string | null, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (value: boolean): void => {
+        if (settled) return
+        settled = true
+        stop()
+        resolve(value)
+      }
+      const unsub = onSnapshot(
+        doc(db, 'projects', projectId),
+        (snap) => {
+          const cur = (snap.data()?.currentSnapshotId as string | undefined) ?? null
+          if (cur && cur !== base) finish(true)
+        },
+        () => {}, // ignore listener errors — the timeout is the backstop
+      )
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      const onAbort = (): void => finish(false)
+      controller?.signal.addEventListener('abort', onAbort, { once: true })
+      function stop(): void {
+        unsub()
+        clearTimeout(timer)
+        controller?.signal.removeEventListener('abort', onAbort)
+      }
+    })
   }
 
   function cancel(): void {
@@ -247,6 +338,7 @@ export function useGeneration(projectId: string) {
 
   return {
     generating,
+    finalizing,
     activePath,
     activeFile,
     files,
