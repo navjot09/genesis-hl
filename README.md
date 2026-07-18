@@ -17,7 +17,7 @@ a sandboxed preview, and every generation is captured as a restorable snapshot.
 
 - **App (Firebase Hosting):** https://genesis-hl.web.app
 - **Cloud Functions base URL:** https://us-central1-genesis-hl.cloudfunctions.net
-- **Loom walkthrough (≤5 min):** _TODO — paste link_
+- **Loom walkthrough (≤5 min):** https://www.loom.com/share/68387436a6634e7ba6aae01dcacc4198
 
 > ⚠️ **Note on the LLM provider.** The brief lists Claude or OpenAI. Genesis is built on a
 > provider-agnostic `LLMProvider` streaming interface with a **Gemini** adapter as the default (the
