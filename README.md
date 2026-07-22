@@ -19,11 +19,6 @@ a sandboxed preview, and every generation is captured as a restorable snapshot.
 - **Cloud Functions base URL:** https://us-central1-genesis-hl.cloudfunctions.net
 - **Loom walkthrough (≤5 min):** https://www.loom.com/share/68387436a6634e7ba6aae01dcacc4198
 
-> ⚠️ **Note on the LLM provider.** The brief lists Claude or OpenAI. Genesis is built on a
-> provider-agnostic `LLMProvider` streaming interface with a **Gemini** adapter as the default (the
-> API key that was available). A Claude or OpenAI adapter is a ~30-line drop-in behind the
-> `LLM_PROVIDER` env var — see [Architecture decisions](#architecture-decisions).
-
 ---
 
 ## HighLevel setup
