@@ -34,53 +34,61 @@ export async function commitGeneration(params: CommitParams): Promise<CommitResu
 
   const projRef = db.collection('projects').doc(params.projectId);
   const snapRef = projRef.collection('snapshots').doc();
-  const batch = db.batch();
-
-  // 1. Immutable snapshot metadata.
-  batch.set(snapRef, {
-    parentSnapshotId: params.parentSnapshotId,
-    prompt: params.prompt,
-    createdAt: FieldValue.serverTimestamp(),
-    manifest: paths,
-    changed: params.ops.map((o) => ({ path: o.path, op: o.op })),
-  });
-
-  // 2. Immutable full copy of every file at this point in time.
-  for (const [path, content] of Object.entries(nextFiles)) {
-    batch.set(snapRef.collection('files').doc(fileDocId(path)), { path, content });
-  }
-
-  // 3. Mutable working set: upsert changed (with the APPLIED content, so edits
-  //    write the patched file, not the raw hunks), delete removed.
-  for (const op of params.ops) {
-    const ref = projRef.collection('files').doc(fileDocId(op.path));
-    if (op.op === 'delete') {
-      batch.delete(ref);
-      continue;
-    }
-    const content = nextFiles[op.path];
-    if (content === undefined) continue; // e.g. a failed edit to a missing file
-    batch.set(ref, { path: op.path, content, updatedAt: FieldValue.serverTimestamp() });
-  }
-
-  // 4. Move the project pointer.
-  batch.set(
-    projRef,
-    { currentSnapshotId: snapRef.id, updatedAt: FieldValue.serverTimestamp() },
-    { merge: true },
-  );
-
-  // 5. Assistant chat message — includes a compact per-file diff for the chat
-  //    "changes" cards (added/removed lines).
   const changes = computeChanges(params.ops, params.currentFiles, nextFiles);
-  batch.set(projRef.collection('messages').doc(), {
-    role: 'assistant',
-    content: params.assistantText,
-    snapshotId: snapRef.id,
-    changes,
-    createdAt: FieldValue.serverTimestamp(),
+
+  // Transaction, not a blind batch: the parent pointer is re-read INSIDE the
+  // transaction so two overlapping generations cannot both claim the same
+  // parent (which would silently fork the snapshot chain and desync the
+  // working set). Last committer parents onto the actual latest snapshot.
+  await db.runTransaction(async (tx) => {
+    const proj = await tx.get(projRef);
+    const freshParent =
+      (proj.data()?.currentSnapshotId as string | undefined) ?? params.parentSnapshotId;
+
+    // 1. Immutable snapshot metadata.
+    tx.set(snapRef, {
+      parentSnapshotId: freshParent,
+      prompt: params.prompt,
+      createdAt: FieldValue.serverTimestamp(),
+      manifest: paths,
+      changed: params.ops.map((o) => ({ path: o.path, op: o.op })),
+    });
+
+    // 2. Immutable full copy of every file at this point in time.
+    for (const [path, content] of Object.entries(nextFiles)) {
+      tx.set(snapRef.collection('files').doc(fileDocId(path)), { path, content });
+    }
+
+    // 3. Mutable working set: upsert changed (with the APPLIED content, so edits
+    //    write the patched file, not the raw hunks), delete removed.
+    for (const op of params.ops) {
+      const ref = projRef.collection('files').doc(fileDocId(op.path));
+      if (op.op === 'delete') {
+        tx.delete(ref);
+        continue;
+      }
+      const content = nextFiles[op.path];
+      if (content === undefined) continue; // e.g. a failed edit to a missing file
+      tx.set(ref, { path: op.path, content, updatedAt: FieldValue.serverTimestamp() });
+    }
+
+    // 4. Move the project pointer.
+    tx.set(
+      projRef,
+      { currentSnapshotId: snapRef.id, updatedAt: FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+
+    // 5. Assistant chat message — includes a compact per-file diff for the chat
+    //    "changes" cards (added/removed lines).
+    tx.set(projRef.collection('messages').doc(), {
+      role: 'assistant',
+      content: params.assistantText,
+      snapshotId: snapRef.id,
+      changes,
+      createdAt: FieldValue.serverTimestamp(),
+    });
   });
 
-  await batch.commit();
   return { snapshotId: snapRef.id, fileCount: paths.length, warnings };
 }

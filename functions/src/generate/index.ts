@@ -18,87 +18,14 @@ import { startSse } from '../http/sse.js';
 import { createProvider } from '../llm/index.js';
 import { buildSystemPrompt } from './systemPrompt.js';
 import { buildMessages, loadProjectContext } from './context.js';
-import { MarkerParser, type ParsedFile } from './markerParser.js';
+import { MarkerParser } from './markerParser.js';
 import { validateOps } from './fileOps.js';
 import { commitGeneration } from './snapshots.js';
-
-/**
- * The chat message is intro PROSE only. If a reset/continuation caused any file
- * content to leak into the prose stream (e.g. a `css">` tag remnant or raw code
- * from a discarded attempt — the file itself is re-created cleanly by the
- * continuation), strip everything from the first leak signature onward so the
- * chat never shows stray code. A normal intro sentence matches none of these.
- */
-function sanitizeChatProse(text: string): string {
-  let s = text.trim();
-  const signatures: RegExp[] = [
-    /<\/?file[\s>]/, // <file ...> or </file>
-    /\n[ \t]*\n[ \t]*\n/, // 3+ newlines: the intro is over — a leak usually follows
-    /(^|\n)\s*\*[ /]/, // JSDoc / comment fragment:  " * foo"  or  " */"
-    /(^|\n)\s*[A-Za-z]{1,6}">/, // tag remnant: css">  js">  html">
-    /(^|\n)\s*\.?\/?[\w.\-/]*\.(js|css|html|json|ts|svg|mjs)"?\s*>/i, // filename remnant: styles.css">  ./app.js">
-    /(^|\n)\s*<!DOCTYPE/i,
-    /(^|\n)\s*<(html|head|body|div|section|main|script|style|nav|header|ul|form)\b/i,
-    /(^|\n)\s*\/\*/, // CSS/JS block comment starting a line
-    /(^|\n)\s*:root\b/,
-    /(^|\n)\s*(const|let|var|function|import|export|async)\s/,
-  ];
-  let cut = s.length;
-  for (const p of signatures) {
-    const m = p.exec(s);
-    if (m) cut = Math.min(cut, m.index === 0 ? 0 : m.index + (m[1] ? m[1].length : 0));
-  }
-  s = s.slice(0, cut).trim();
-  if (s.length > 1500) s = s.slice(0, 1500).trim() + '…';
-  return s;
-}
-
-/**
- * Local files referenced by an HTML file (script src / link href / img src)
- * that were NOT generated — indicates a broken app (e.g. index.html links
- * ./app.js but app.js is missing). Used to auto-continue and fill the gap.
- */
-function findMissingReferencedFiles(files: ParsedFile[]): string[] {
-  const present = new Set(files.filter((f) => f.op !== 'delete').map((f) => f.path));
-  const referenced = new Set<string>();
-  for (const f of files) {
-    if (f.op === 'delete' || !/\.html?$/i.test(f.path)) continue;
-    const re = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(f.content)) !== null) {
-      let ref = m[1].trim();
-      if (/^(https?:|data:|blob:|#|mailto:|tel:|\/\/)/i.test(ref)) continue; // external
-      ref = ref.replace(/^\.?\//, '').split(/[?#]/)[0]; // normalise ./x, /x, strip query/hash
-      if (ref && /\.(js|css)$/i.test(ref) && !present.has(ref)) referenced.add(ref);
-    }
-  }
-  return [...referenced];
-}
-
-/** Whether a stream error looks like a transient/connection failure worth resuming. */
-function isTransient(detail?: string): boolean {
-  if (!detail) return true; // unknown mid-stream failure → assume resumable
-  const d = detail.toLowerCase();
-  return [
-    'terminated',
-    'econnreset',
-    'reset',
-    'fetch failed',
-    'network',
-    'socket',
-    'timeout',
-    'enotfound',
-    'eai_again',
-    'unavailable',
-    'overloaded',
-    '503',
-    '502',
-    '500',
-  ].some((s) => d.includes(s));
-}
+import { findMissingReferencedFiles, isTransient, sanitizeChatProse } from './heuristics.js';
+import { checkRateLimit } from '../lib/rateLimit.js';
 
 export const generate = onRequest(
-  { cors: true, secrets: [GEMINI_API_KEY], timeoutSeconds: 3600, memory: '512MiB' },
+  { cors: true, secrets: [GEMINI_API_KEY], timeoutSeconds: 600, memory: '512MiB', concurrency: 4 },
   async (req, res) => {
     if (req.method !== 'POST') {
       res.status(405).json({ error: 'Use POST' });
@@ -113,9 +40,20 @@ export const generate = onRequest(
       return;
     }
 
-    const body = (req.body ?? {}) as { projectId?: unknown; prompt?: unknown; model?: unknown };
+    const body = (req.body ?? {}) as {
+      projectId?: unknown;
+      prompt?: unknown;
+      model?: unknown;
+      messageId?: unknown;
+    };
     const projectId = typeof body.projectId === 'string' ? body.projectId : '';
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    // Client-supplied idempotency key: a retried request must not duplicate the
+    // user message in the chat log (which would also pollute future prompts).
+    const messageId =
+      typeof body.messageId === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(body.messageId)
+        ? body.messageId
+        : null;
     if (!projectId || !prompt) {
       res.status(400).json({ error: 'projectId and prompt are required' });
       return;
@@ -127,16 +65,30 @@ export const generate = onRequest(
       return;
     }
 
+    // Cost control: generation drives LLM spend, so it is quota'd per user.
+    const rl = await checkRateLimit(uid, 'generate', 20, 60 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: 'Generation limit reached (20/hour). Please try again later.',
+        retryAfterSeconds: Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000)),
+      });
+      return;
+    }
+
     // Persist the user message before streaming (authoritative chat log).
-    await db
-      .collection('projects')
-      .doc(projectId)
-      .collection('messages')
-      .add({ role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp() });
+    // With a client messageId this is idempotent (set on a fixed doc id).
+    const messagesCol = db.collection('projects').doc(projectId).collection('messages');
+    const userMsg = { role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp() };
+    if (messageId) await messagesCol.doc(messageId).set(userMsg);
+    else await messagesCol.add(userMsg);
 
     const sse = startSse(res, req);
-    const abort = new AbortController();
-    req.on('close', () => abort.abort());
+    // NOTE: a client disconnect does NOT abort generation. The SSE stream is a
+    // best-effort live view; the source of truth is the Firestore commit. On
+    // networks that reset long-lived streams, the server finishes and commits,
+    // and the client recovers the result by watching currentSnapshotId. Token
+    // cost of finishing an abandoned run is bounded and accepted — it keeps the
+    // "your work is never lost" promise true by construction.
 
     let assistantText = '';
     // Keep ONLY the first attempt's intro prose. Continuations (after a network
@@ -166,8 +118,8 @@ export const generate = onRequest(
 
     const provider = createProvider({
       provider: LLM_PROVIDER.value(),
-      geminiApiKey: GEMINI_API_KEY.value(),
-      geminiModel: GEMINI_MODEL.value(),
+      apiKey: GEMINI_API_KEY.value(),
+      model: GEMINI_MODEL.value(),
     });
     const model = body.model === 'heavy' ? GEMINI_MODEL_HEAVY.value() : GEMINI_MODEL.value();
     const system = buildSystemPrompt();
@@ -184,7 +136,7 @@ export const generate = onRequest(
     for (let attempt = 0; ; attempt++) {
       try {
         result = await provider.stream(
-          { system, messages, model, maxOutputTokens: 32000, signal: abort.signal },
+          { system, messages, model, maxOutputTokens: 32000 },
           (delta) => {
             rawSoFar += delta;
             parser.feed(delta);
@@ -195,7 +147,7 @@ export const generate = onRequest(
         result = { text: rawSoFar, stopReason: 'error', detail: String(err) };
       }
 
-      if (sse.closed || result.stopReason === 'aborted') break;
+      if (result.stopReason === 'aborted') break;
 
       // Decide whether to resume, and why (drives the continuation instruction).
       let resumeReason: string | null = null;
@@ -244,11 +196,6 @@ export const generate = onRequest(
     parser.end();
     if (!result) result = { text: rawSoFar, stopReason: 'error', detail: 'no result' };
 
-    if (result.stopReason === 'aborted' || sse.closed) {
-      sse.send('error', { stage: 'aborted', message: 'Generation cancelled' });
-      sse.end();
-      return;
-    }
 
     // Validate everything the parser fully closed before touching Firestore.
     // (An interrupted stream still yields every completed <file> block.)
