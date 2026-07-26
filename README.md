@@ -19,10 +19,11 @@ a sandboxed preview, and every generation is captured as a restorable snapshot.
 - **Cloud Functions base URL:** https://us-central1-genesis-hl.cloudfunctions.net
 - **Loom walkthrough (≤5 min):** https://www.loom.com/share/68387436a6634e7ba6aae01dcacc4198
 
-> ⚠️ **Note on the LLM provider.** The brief lists Claude or OpenAI. Genesis is built on a
-> provider-agnostic `LLMProvider` streaming interface with a **Gemini** adapter as the default (the
-> API key that was available). A Claude or OpenAI adapter is a ~30-line drop-in behind the
-> `LLM_PROVIDER` env var — see [Architecture decisions](#architecture-decisions).
+> ⚠️ **Note on the LLM provider.** The brief lists Claude or OpenAI. Genesis runs on **Gemini**
+> (the API key that was available) behind a provider-neutral `LLMProvider.stream()` interface.
+> Honest scope: adding Claude/OpenAI means implementing that interface **plus** declaring the new
+> secret and binding it on the endpoint (Firebase requires static secret declarations) — a small,
+> localized change, but not a config-only toggle.
 
 ---
 
@@ -85,19 +86,25 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
 
 ## Architecture decisions
 
-- **Provider-agnostic LLM layer.** One `LLMProvider.stream()` interface; Gemini adapter by default,
-  Claude/OpenAI swappable via `LLM_PROVIDER`. Satisfies the spec's intent while running on the key we had.
-- **Marker file protocol over JSON tool-use.** The model emits `<file path="…" op="…">…</file>` in a
-  plain-text stream, parsed incrementally for live Monaco display + file-boundary SSE events, then
-  validated with Zod. JSON structured output escapes file bodies (unreadable while streaming) and can
-  lose partial output on truncation.
-- **Fast incremental edits.** Small changes use `op="edit"` with `SEARCH/REPLACE` hunks (applied
-  server-side, whitespace-tolerant) instead of re-emitting whole files — ~10× less output and much
-  faster; full `op="write"` only for new files or large rewrites.
+- **Provider-neutral LLM seam.** The pipeline depends only on `LLMProvider.stream()`; the Gemini
+  adapter fully encapsulates the SDK. Adding Claude/OpenAI = implement the interface + declare its
+  secret on the endpoint (see the provider note above for honest scope).
+- **Marker file protocol (with eyes open).** The model emits `<file path="…" op="…">…</file>` in a
+  plain-text stream, parsed incrementally (unit-tested: attribute drift, malformed-tag recovery,
+  chunk-boundary splits) then validated with Zod. Known trade-off: text markers carry the full
+  correctness burden and cannot escape their own delimiter — Gemini's newer streamed function calling
+  (`streamFunctionCallArguments`) removes that class entirely and is the planned migration (see
+  "What I would improve").
+- **Fast incremental edits.** Small changes use `op="edit"` with `SEARCH/REPLACE` hunks instead of
+  re-emitting whole files — ~10× less output. Hunks apply **strictly**: matches are line-anchored and
+  must be unique, so an ambiguous edit fails loudly (surfaced as a warning) rather than silently
+  patching the wrong place.
 - **The generated app never holds the HL token.** It runs in a sandboxed `srcdoc` iframe (no
-  `allow-same-origin`, so it can't touch the Firebase session) and calls a same-app proxy (`/hlProxy`)
-  authenticated by a short-lived, single-location **preview capability token**; the proxy injects the
-  real token server-side and enforces a strict **endpoint allowlist**.
+  `allow-same-origin`) with a **strict CSP** — network egress is locked to the Genesis proxy origin,
+  so even malicious generated JS cannot exfiltrate its token. It calls the proxy (`/hlProxy`) with a
+  short-lived, single-location **preview capability token**; the proxy injects the real HL token
+  server-side, enforces a strict **endpoint allowlist**, and **rate-limits side-effecting calls**
+  (message sends / contact writes) so a bad generation can't spam real customers.
 - **2nd-gen Cloud Functions for true SSE.** Streamed directly (not via Hosting rewrites, which buffer),
   raised `timeoutSeconds`, heartbeats. The client consumes it with `fetch` + `ReadableStream` (not
   `EventSource`, which can't send the Firebase auth header).
@@ -116,20 +123,41 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
   forwarded to HL). The injected runtime exposes `window.__GENESIS__.onWebhook(handler)` — the polling
   loop lives in the bridge, so generated code just registers a handler and the sandboxed iframe never
   touches Firestore directly. (Signature verification of HL's payload is the next hardening step.)
-- **Automatic continuation on interruption.** Generation keeps every completed `<file>` and resumes from
-  a clean boundary on a mid-stream drop / `max_tokens` / RECITATION — partial results are always
-  preserved in a snapshot with a clear message. (Discovered the local network resets Gemini streams at
-  ~15s; deployed GCP functions don't.)
+- **Generation survives client disconnects by design.** The SSE stream is a cosmetic live view; the
+  server intentionally keeps generating and **commits transactionally** even if the browser drops the
+  connection (some networks reset long-lived streams). The client then recovers the result by watching
+  the project's snapshot pointer. Upstream interruptions (`max_tokens`, RECITATION, provider resets)
+  auto-continue from the last completed file boundary.
 - **Emulators-first.** Everything developed against an offline `demo-genesis` project; secrets in Cloud
   Secret Manager, non-secret config in `.env`; the same code deploys unchanged.
+
+## Testing & CI
+
+- **78 unit tests** (vitest) over the correctness-critical pure logic: the streaming marker parser
+  (chunk-boundary splits, attribute drift, malformed-tag recovery), the search/replace edit applier
+  (line anchoring, uniqueness, whitespace tolerance), the proxy allowlist (traversal, method/paths,
+  reserved literals), and the prose heuristics. One `it.skip` documents the known `</file>`-in-content
+  limitation the function-calling migration removes.
+- **GitHub Actions CI** on every push/PR: ESLint (flat config, Vue + TS) → typecheck → unit tests →
+  frontend typecheck + build.
+- `npm test` (root) runs the suite; `npm run lint` / `npm run format` cover style.
+
+```bash
+npm --prefix functions run test   # unit tests
+npm run lint                      # eslint over functions/src + frontend/src
+```
 
 ## What I would improve
 
 - **Durable generation jobs.** Today the SSE request *is* the job; make generation a background job so a
   dropped client can reconnect and resume, with a queue for concurrency.
-- **Rate limiting + abuse controls** on the generation and proxy endpoints (per-user quotas, token
-  budgets), and **verifying HL's webhook signature** on the `hlWebhook` receiver (today it accepts and
-  stores; production should validate HL's RSA-signed payload and drop unrecognised locations).
+- **Migrate the wire format to Gemini's streamed function calling** (`streamFunctionCallArguments`)
+  — structured file ops with JSON escaping and per-field streaming would delete the marker parser,
+  the prose sanitizer, and the delimiter-collision class entirely, and enable error-feedback retry
+  loops for failed edits.
+- **Verify HL's webhook signature** on `hlWebhook` (today: known-location gate + ingest rate cap;
+  production should validate HL's RSA-signed payload), and add **App Check + email verification** in
+  front of the auth surface.
 - **Richer, versioned HL API context** for the model (dynamic per-request scoping and a larger, tested
   reference) instead of a curated static prompt — reduces shape-mismatch bugs like the nested messages one.
 - **Hardening:** encrypt HL tokens at rest (KMS), a scheduled proactive token-refresh cron, a strict CSP,

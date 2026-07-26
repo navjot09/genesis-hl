@@ -10,9 +10,19 @@
     "build:functions": "npm --prefix functions run build",
     "build:frontend": "npm --prefix frontend run build",
     "build": "npm run build:functions && npm run build:frontend",
-    "deploy": "npm run build && firebase deploy"
+    "deploy": "npm run build && firebase deploy",
+    "lint": "eslint functions/src frontend/src",
+    "lint:fix": "eslint functions/src frontend/src --fix",
+    "format": "prettier --check \"functions/src/**/*.ts\" \"frontend/src/**/*.{ts,vue}\"",
+    "format:fix": "prettier --write \"functions/src/**/*.ts\" \"frontend/src/**/*.{ts,vue}\"",
+    "test": "npm --prefix functions run test"
   },
   "devDependencies": {
-    "firebase-tools": "^15.23.0"
+    "@vue/eslint-config-typescript": "^14.9.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-vue": "^10.10.0",
+    "firebase-tools": "^15.23.0",
+    "prettier": "^3.9.6",
+    "typescript-eslint": "^8.65.0"
   }
 }

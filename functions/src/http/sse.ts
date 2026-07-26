@@ -7,18 +7,19 @@
  *   - NO Content-Length and NO gzip on this route (both force buffering)
  *   - Call the SSE endpoint at the DIRECT function URL, never a Hosting rewrite.
  *
- * Event protocol used by Genesis (see the generation pipeline):
- *   token        { text }                     incremental model output
- *   file_open    { path, op }                 a <file> block started
- *   file_close   { path }                     a <file> block finished
- *   snapshot     { snapshotId }               generation committed
- *   done         { ... }                      stream finished cleanly
- *   error        { stage, message, detail? }  something failed (partial preserved)
+ * Event protocol used by Genesis (single source of truth: the SseEvent type
+ * below — keep this comment in sync with it):
+ *   assistant_delta { text }                     incremental chat prose
+ *   file_open       { path, op }                 a <file> block started
+ *   file_delta      { path, text }               incremental file content
+ *   file_close      { path }                     a <file> block finished
+ *   snapshot        { snapshotId, fileCount }    generation committed
+ *   done            { stopReason, ... }          stream finished cleanly
+ *   error           { stage, message, detail? }  something failed (partial preserved)
  */
 import type { Response } from 'express';
 
 export type SseEvent =
-  | 'token'
   | 'assistant_delta'
   | 'file_open'
   | 'file_delta'
