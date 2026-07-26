@@ -15,6 +15,7 @@ import { onRequest } from 'firebase-functions/v2/https';
 import { logger } from 'firebase-functions/v2';
 import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../lib/admin.js';
+import { checkRateLimit } from '../lib/rateLimit.js';
 
 /** Best-effort extraction of the location id from a variety of HL payload shapes. */
 function extractLocationId(body: Record<string, unknown>): string | null {
@@ -36,6 +37,28 @@ export const hlWebhook = onRequest({ cors: false, timeoutSeconds: 30 }, async (r
   // Always 200 quickly so HL doesn't retry; ignore events we can't route.
   if (!locationId) {
     res.status(200).json({ ok: true, ignored: 'no locationId' });
+    return;
+  }
+
+  // Spoof/DoS gate: only store events for locations a Genesis user has actually
+  // connected. locationId comes from an unauthenticated request body, so an
+  // attacker knowing a victim's locationId could otherwise inject unlimited
+  // fake events. (Full fix — HL's RSA webhook signature — noted in README.)
+  const known = await db
+    .collection('users')
+    .where('hl.locationId', '==', locationId)
+    .limit(1)
+    .get();
+  if (known.empty) {
+    res.status(200).json({ ok: true, ignored: 'unknown location' });
+    return;
+  }
+
+  // Storage-cost cap per location: even a legitimate location can't flood
+  // Firestore (120 events/min is far above HL's real emission rate).
+  const rl = await checkRateLimit(locationId, 'webhook-ingest', 120, 60_000);
+  if (!rl.allowed) {
+    res.status(200).json({ ok: true, ignored: 'rate limited' });
     return;
   }
 

@@ -20,6 +20,18 @@ import { hlFetch } from '../hl/client.js';
 import { HlAuthError } from '../hl/tokens.js';
 import { matchRule } from './allowlist.js';
 import { mintPreviewJwt, verifyPreviewJwt } from './preview.js';
+import { checkRateLimit } from '../lib/rateLimit.js';
+
+/**
+ * Endpoints with real-world side effects (messages sent to actual customers,
+ * contact writes). These get a per-user quota so a prompt-injected or buggy
+ * generated app cannot spam a tenant's real contacts.
+ */
+function hasSideEffects(method: string, hlPath: string): boolean {
+  if (method === 'PUT' || method === 'DELETE') return true;
+  if (method !== 'POST') return false;
+  return hlPath !== '/contacts/search'; // POST search is read-shaped; other POSTs mutate
+}
 
 /** Mint a preview capability token for the signed-in user's connected location. */
 export const mintPreviewToken = onRequest(
@@ -156,6 +168,20 @@ export const hlProxy = onRequest(
         hint: 'The Genesis proxy exposes a fixed allowlist of HighLevel endpoints.',
       });
       return;
+    }
+
+    // Side-effecting endpoints (send message, write contact) are quota'd: the
+    // preview runs UNTRUSTED generated code, and these actions reach real
+    // customers. 15/min per user bounds the blast radius of a bad generation.
+    if (hasSideEffects(req.method, hlPath)) {
+      const rl = await checkRateLimit(uid, 'hl-write', 15, 60_000);
+      if (!rl.allowed) {
+        res.status(429).json({
+          error: 'Write limit reached (15/min). Slow down and try again shortly.',
+          retryAfterSeconds: Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000)),
+        });
+        return;
+      }
     }
 
     // --- Enforce location scoping. ---

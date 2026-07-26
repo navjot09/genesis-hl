@@ -76,7 +76,34 @@ export function buildPreviewHtml(
   // app uses its demo fallback). JSON.stringify keeps the token out of the way
   // of any accidental </script> in content.
   const envJson = env ? JSON.stringify(env) : 'undefined'
-  return injectIntoHead(html, buildBridge(envJson))
+  return injectIntoHead(html, buildCsp(env) + buildBridge(envJson))
+}
+
+/**
+ * Content-Security-Policy for the preview document.
+ *
+ * The iframe runs UNTRUSTED generated code holding a capability token; without
+ * a CSP, malicious generated JS could exfiltrate that token to any host (fetch
+ * or img beacon). Lock network egress to the Genesis proxy origin only:
+ *  - connect-src: the proxy origin — the app's only legitimate data channel
+ *  - img/font/media: data:/blob: only, so no URL-based beacons
+ *  - form-action 'none': no form-based exfiltration
+ * Inline script/style must stay allowed — the whole app is inlined into srcdoc.
+ */
+function buildCsp(env: GenesisEnv | null): string {
+  const proxyOrigin = env ? new URL(env.proxyUrl).origin : "'none'"
+  const policy = [
+    `default-src 'none'`,
+    `script-src 'unsafe-inline'`,
+    `style-src 'unsafe-inline'`,
+    `connect-src ${proxyOrigin}`,
+    `img-src data: blob:`,
+    `font-src data:`,
+    `media-src data: blob:`,
+    `form-action 'none'`,
+    `base-uri 'none'`,
+  ].join('; ')
+  return `<meta http-equiv="Content-Security-Policy" content="${policy}">\n`
 }
 
 /**

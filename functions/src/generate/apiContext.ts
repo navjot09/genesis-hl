@@ -26,6 +26,11 @@ Make every data request like this (note: DO NOT send locationId — the proxy ad
 Always handle loading, empty, and error states. If window.__GENESIS__ is undefined
 (app opened outside the preview), show a friendly "Connect HighLevel in Genesis" message.
 
+SECURITY SANDBOX: the preview enforces a strict Content-Security-Policy. Network
+requests are ONLY allowed to the Genesis proxy; external images, fonts, CDNs and
+third-party scripts will NOT load. Use CSS, emoji, inline SVG, or data: URIs for
+visuals — never hotlink external resources.
+
 ## Realtime HighLevel events (optional — use when the app should react live)
 
 The runtime also provides \`window.__GENESIS__.onWebhook(handler)\` — a live feed of
