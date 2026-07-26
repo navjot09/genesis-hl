@@ -23,8 +23,12 @@ export interface ParsedFile {
   content: string;
 }
 
-const OPEN_TAG = /^<file\s+path="([^"]+)"(?:\s+op="(write|edit|delete)")?\s*>/;
 const CLOSE = '</file>';
+// Attribute extraction from a complete open tag ("<file ...>"): quotes may be
+// single or double and attributes may appear in any order — models drift on
+// both, and a dropped file due to attribute style is a silent data loss.
+const PATH_ATTR = /(?:^|\s)path\s*=\s*(?:"([^"]+)"|'([^']+)')/;
+const OP_ATTR = /(?:^|\s)op\s*=\s*(?:"(write|edit|delete)"|'(write|edit|delete)')/;
 
 export class MarkerParser {
   private buffer = '';
@@ -81,19 +85,31 @@ export class MarkerParser {
           this.flushProse(idx);
           continue;
         }
-        // Buffer starts with "<file" — try to match a complete open tag.
-        const m = OPEN_TAG.exec(this.buffer);
-        if (!m) {
-          // Incomplete tag: wait for more input (unless the stream is over).
-          if (final) {
-            this.flushProse(this.buffer.length); // malformed trailing tag -> treat as prose
-          }
+        // Buffer starts with "<file" — but only treat it as a tag opener if the
+        // next char is whitespace or '>' ("<filesystem>" in prose is not a tag).
+        if (this.buffer.length > 5 && !/[\s>]/.test(this.buffer[5])) {
+          this.flushProse(5); // emit "<file" as prose, rescan the rest
+          continue;
+        }
+        // Wait until the full tag ("...>") has arrived before deciding.
+        const gt = this.buffer.indexOf('>');
+        if (gt === -1) {
+          if (final) this.flushProse(this.buffer.length); // truncated tag -> prose
           return;
         }
-        this.path = m[1];
-        this.op = (m[2] as 'write' | 'edit' | 'delete') || 'write';
+        const tag = this.buffer.slice(0, gt + 1);
+        const pathM = PATH_ATTR.exec(tag);
+        if (!pathM) {
+          // Malformed tag (no parsable path). Emit it as prose and MOVE PAST it —
+          // a bad tag must never swallow every subsequent file in the stream.
+          this.flushProse(gt + 1);
+          continue;
+        }
+        this.path = pathM[1] ?? pathM[2];
+        const opM = OP_ATTR.exec(tag);
+        this.op = (opM?.[1] ?? opM?.[2] ?? 'write') as 'write' | 'edit' | 'delete';
         this.content = '';
-        this.buffer = this.buffer.slice(m[0].length);
+        this.buffer = this.buffer.slice(gt + 1);
         this.mode = 'infile';
         this.emit({ type: 'file_open', path: this.path, op: this.op });
         continue;
@@ -108,8 +124,11 @@ export class MarkerParser {
         // On final with an unterminated file: discard (do NOT push to files).
         return;
       }
+      // flushContent(close) already consumed `close` chars — only the marker
+      // itself remains to skip. (Slicing `close + CLOSE.length` here was a
+      // double-consume bug that dropped chars after every close tag.)
       this.flushContent(close);
-      this.buffer = this.buffer.slice(close + CLOSE.length);
+      this.buffer = this.buffer.slice(CLOSE.length);
       this.emit({ type: 'file_close', path: this.path });
       this.files.push({ path: this.path, op: this.op, content: this.content });
       this.mode = 'prose';

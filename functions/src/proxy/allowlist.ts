@@ -20,7 +20,11 @@ export interface AllowRule {
   locationId: LocationPlacement;
 }
 
-const ID = '[A-Za-z0-9_-]+';
+// Resource-id segment. The negative lookahead keeps RESERVED literal segments
+// (sub-resources like /search, /messages, /events) from being swallowed by the
+// {id} wildcard — otherwise e.g. PUT /contacts/search would forward to HL as an
+// update of a contact literally named "search".
+const ID = '(?!(?:search|messages|events|free-slots)$)[A-Za-z0-9_-]+';
 
 const RULES: AllowRule[] = [
   // Contacts (Version 2021-07-28)

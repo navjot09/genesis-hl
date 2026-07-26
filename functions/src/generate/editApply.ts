@@ -49,20 +49,46 @@ function normalizeTrailing(s: string): string {
 }
 
 /**
+ * All occurrences of `needle` in `haystack` that are LINE-ANCHORED: the match
+ * must begin at a line start and end at a line end. This is what makes edit
+ * application safe — an un-anchored indexOf can splice mid-word ("count"
+ * inside "account") or mid-indent (a 2-space search matching inside a 4-space
+ * line), silently corrupting the file.
+ */
+function findLineAnchored(haystack: string, needle: string): number[] {
+  const hits: number[] = [];
+  let from = 0;
+  for (;;) {
+    const i = haystack.indexOf(needle, from);
+    if (i === -1) break;
+    from = i + 1;
+    const startsLine = i === 0 || haystack[i - 1] === '\n';
+    const endChar = haystack[i + needle.length];
+    const endsLine = endChar === undefined || endChar === '\n' || endChar === '\r';
+    if (startsLine && endsLine) hits.push(i);
+  }
+  return hits;
+}
+
+/**
  * Find `search` in `text`, returning [start, end) in ORIGINAL text coordinates.
- * Tries exact match, then a trailing-whitespace-normalized match.
+ * Exact line-anchored match first, then a trailing-whitespace-normalized match.
+ * A match is returned ONLY when it is unique — an ambiguous search (multiple
+ * occurrences) fails loudly rather than silently patching the first one.
  */
 function locate(text: string, search: string): [number, number] | null {
-  const exact = text.indexOf(search);
-  if (exact !== -1) return [exact, exact + search.length];
+  const exact = findLineAnchored(text, search);
+  if (exact.length === 1) return [exact[0], exact[0] + search.length];
+  if (exact.length > 1) return null; // ambiguous — refuse to guess
 
   // Whitespace-tolerant: match on normalized text, then map the end back by
   // walking the original text over the same number of normalized chars.
   const normText = normalizeTrailing(text);
   const normSearch = normalizeTrailing(search);
   if (normSearch === '') return null;
-  const nIdx = normText.indexOf(normSearch);
-  if (nIdx === -1) return null;
+  const tolerant = findLineAnchored(normText, normSearch);
+  if (tolerant.length !== 1) return null; // absent or ambiguous
+  const nIdx = tolerant[0];
 
   // Map normalized [nIdx, nIdx+len) back to original indices. normalizeTrailing
   // only removes trailing spaces/tabs before newlines, so we can walk in step.
