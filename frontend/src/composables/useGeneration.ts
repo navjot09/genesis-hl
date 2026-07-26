@@ -207,7 +207,9 @@ export function useGeneration(projectId: string) {
     try {
       const res = await authedFetch('/generate', {
         method: 'POST',
-        body: JSON.stringify({ projectId, prompt: text }),
+        // messageId = idempotency key: a retried request must not duplicate
+        // the user message in the chat log.
+        body: JSON.stringify({ projectId, prompt: text, messageId: crypto.randomUUID() }),
         signal: controller.signal,
       })
 
@@ -240,11 +242,19 @@ export function useGeneration(projectId: string) {
       buffer += decoder.decode()
       const trailing = parseEventBlock(buffer)
       if (trailing) dispatch(trailing)
+
+      // Clean EOF without a terminal event: a proxy gracefully closed the
+      // stream mid-generation (resolves done=true, nothing thrown). Same
+      // situation as a dropped connection — recover from the commit.
+      if (streamStarted && !sawResult) {
+        await recoverAfterDrop(baseSnapshotId)
+      }
     } catch (err) {
       if (controller?.signal.aborted) {
-        // User pressed Stop — the backend sees the disconnect and stops.
-        toast.info('Generation stopped', {
-          description: 'Any completed files were kept.',
+        // User pressed Stop. The server intentionally finishes and commits
+        // (results are never lost); we just stop watching the stream.
+        toast.info('Stopped watching', {
+          description: 'Generation finishes on the server — results will appear shortly.',
         })
       } else if (streamStarted && !sawResult) {
         // The stream dropped mid-generation (common on networks that cut
