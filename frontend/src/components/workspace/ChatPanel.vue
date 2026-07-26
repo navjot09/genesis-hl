@@ -2,6 +2,7 @@
 import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import {
   collection,
+  limitToLast,
   onSnapshot,
   orderBy,
   query,
@@ -49,6 +50,8 @@ watch(
     const q = query(
       collection(db, 'projects', id, 'messages'),
       orderBy('createdAt', 'asc'),
+      // Bounded: chat renders the recent conversation, not unbounded history.
+      limitToLast(200),
     )
     unsub = onSnapshot(
       q,

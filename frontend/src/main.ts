@@ -2,7 +2,6 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import 'vue-sonner/style.css'
 import './style.css'
-import './lib/monaco' // configure Monaco (local bundle + workers) once, before any editor mounts
 import App from './App.vue'
 import router from './router'
 

@@ -22,7 +22,7 @@ import {
 } from '@lucide/vue'
 import { toast } from 'vue-sonner'
 import { db } from '@/lib/firebase'
-import { languageForPath } from '@/lib/monaco'
+import { languageForPath } from '@/lib/language'
 import { GenerationKey } from '@/composables/useGeneration'
 import { useSnapshotDiff } from '@/composables/useSnapshotDiff'
 import { Button } from '@/components/ui/button'
@@ -35,6 +35,13 @@ const props = defineProps<{ projectId: string }>()
 const injected = inject(GenerationKey)
 if (!injected) throw new Error('EditorPanel must be used inside a workspace that provides generation state')
 const generation = injected
+
+// Monaco is a multi-MB bundle — dynamically import (and configure) it only
+// when the editor actually mounts, so login/dashboard never pay for it.
+const monacoReady = ref(false)
+void import('@/lib/monaco').then(() => {
+  monacoReady.value = true
+})
 
 const isGenerating = computed(() => generation.generating.value)
 
@@ -460,7 +467,7 @@ const hasFiles = computed(() => treePaths.value.length > 0)
         <!-- Monaco (code) / Diff -->
         <div class="relative min-h-0 min-w-0 flex-1">
           <VueMonacoDiffEditor
-            v-if="activePath && viewMode === 'diff'"
+            v-if="monacoReady && activePath && viewMode === 'diff'"
             :original="diffOriginal"
             :modified="diffModified"
             :language="activeLanguage"
@@ -470,7 +477,7 @@ const hasFiles = computed(() => treePaths.value.length > 0)
             height="100%"
           />
           <VueMonacoEditor
-            v-else-if="activePath"
+            v-else-if="monacoReady && activePath"
             v-model:value="editorValue"
             :path="activePath"
             :language="activeLanguage"

@@ -9,6 +9,7 @@ import {
   doc,
   onSnapshot,
   orderBy,
+  limit,
   query,
   type Timestamp,
   type Unsubscribe,
@@ -31,7 +32,8 @@ export function useSnapshots(projectId: string) {
   const restoring = ref<string | null>(null)
 
   const unsubSnaps: Unsubscribe = onSnapshot(
-    query(collection(db, 'projects', projectId, 'snapshots'), orderBy('createdAt', 'desc')),
+    // Bounded: the timeline UI only needs recent history, not every snapshot ever.
+    query(collection(db, 'projects', projectId, 'snapshots'), orderBy('createdAt', 'desc'), limit(50)),
     (snap) => {
       snapshots.value = snap.docs.map((d) => {
         const x = d.data() as {

@@ -30,28 +30,4 @@ interface MonacoEnvironmentHost {
 // Hand our locally-bundled monaco to the loader so it never fetches the CDN.
 loader.config({ monaco: monaco as unknown as Parameters<typeof loader.config>[0]['monaco'] })
 
-/** Map a file path's extension to a Monaco language id. */
-export function languageForPath(path: string): string {
-  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase()
-  switch (ext) {
-    case 'html':
-    case 'htm':
-      return 'html'
-    case 'css':
-      return 'css'
-    case 'json':
-      return 'json'
-    case 'ts':
-      return 'typescript'
-    case 'js':
-    case 'mjs':
-    case 'cjs':
-      return 'javascript'
-    case 'vue':
-      return 'html'
-    case 'md':
-      return 'markdown'
-    default:
-      return 'plaintext'
-  }
-}
+export { languageForPath } from './language'
