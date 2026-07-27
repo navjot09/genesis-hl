@@ -23,7 +23,7 @@
     "acorn": "^8.17.0",
     "acorn-walk": "^8.3.5",
     "diff": "^9.0.0",
-    "firebase-admin": "^13.10.0",
+    "firebase-admin": "^14.2.0",
     "firebase-functions": "^7.2.5",
     "jsonwebtoken": "^9.0.3",
     "undici": "^8.7.0",
