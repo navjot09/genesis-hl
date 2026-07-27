@@ -11,7 +11,7 @@ import type { ParsedFile } from './markerParser.js';
  * inline code mentions, multi-paragraph text — must survive untouched; only
  * clear file-content markers trigger a cut.
  */
-export function sanitizeChatProse(text: string): string {
+export function sanitizeChatProse(text: string, maxChars = 1500): string {
   let s = text.trim();
   const signatures: RegExp[] = [
     /<\/?file[\s>]/, // <file ...> or </file> marker
@@ -25,7 +25,7 @@ export function sanitizeChatProse(text: string): string {
     if (m) cut = Math.min(cut, m.index === 0 ? 0 : m.index + (m[1] ? m[1].length : 0));
   }
   s = s.slice(0, cut).trim();
-  if (s.length > 1500) s = s.slice(0, 1500).trim() + '…';
+  if (s.length > maxChars) s = s.slice(0, maxChars).trim() + '…';
   return s;
 }
 

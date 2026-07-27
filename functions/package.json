@@ -14,11 +14,14 @@
     "serve": "npm run build && firebase emulators:start --only functions",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@google/genai": "^2.11.0",
     "@types/diff": "^7.0.2",
+    "acorn": "^8.17.0",
+    "acorn-walk": "^8.3.5",
     "diff": "^9.0.0",
     "firebase-admin": "^13.10.0",
     "firebase-functions": "^7.2.5",
@@ -29,6 +32,7 @@
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^3.2.7",
     "typescript": "^7.0.2",
     "vitest": "^3.2.7"
   }

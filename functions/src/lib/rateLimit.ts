@@ -21,10 +21,12 @@ export async function checkRateLimit(
   action: string,
   limit: number,
   windowMs: number,
+  // Injectable clock: window-rollover behavior is testable without mocking globals.
+  now: () => number = Date.now,
 ): Promise<RateLimitResult> {
   const ref = db.collection('rateLimits').doc(`${uid}__${action}`);
-  const now = Date.now();
-  const windowStart = Math.floor(now / windowMs) * windowMs;
+  const ts = now();
+  const windowStart = Math.floor(ts / windowMs) * windowMs;
 
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -34,7 +36,7 @@ export async function checkRateLimit(
     if (count >= limit) {
       return { allowed: false, remaining: 0, resetAt: windowStart + windowMs };
     }
-    tx.set(ref, { windowStart, count: count + 1, updatedAt: now });
+    tx.set(ref, { windowStart, count: count + 1, updatedAt: ts });
     return { allowed: true, remaining: limit - count - 1, resetAt: windowStart + windowMs };
   });
 }

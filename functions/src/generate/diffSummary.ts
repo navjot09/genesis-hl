@@ -5,22 +5,9 @@
  * collapsed), plus add/del counts. Bounded so a chat message never bloats.
  */
 import { diffLines } from 'diff';
+import type { DiffRow, DiffRowKind, FileChange } from '../shared/contracts.js';
 
-export type DiffRowKind = '+' | '-' | ' ' | 'gap';
-
-export interface DiffRow {
-  t: DiffRowKind;
-  text: string;
-}
-
-export interface FileChange {
-  path: string;
-  op: 'write' | 'edit' | 'delete';
-  additions: number;
-  deletions: number;
-  rows: DiffRow[];
-  truncated: boolean;
-}
+export type { DiffRow, DiffRowKind, FileChange } from '../shared/contracts.js';
 
 const CONTEXT = 2; // unchanged lines kept around each change
 const MAX_ROWS = 80; // hard cap on rows shown per file

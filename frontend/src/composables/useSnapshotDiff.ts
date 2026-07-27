@@ -3,16 +3,10 @@
  * the PARENT of the project's current snapshot. Diffing current-vs-parent shows
  * exactly what the most recent generation changed.
  */
-import { onUnmounted, reactive, ref, watch } from 'vue'
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  onSnapshot,
-  type Unsubscribe,
-} from 'firebase/firestore'
+import { reactive, ref, watch } from 'vue'
+import { collection, doc, getDoc, getDocs } from 'firebase/firestore'
 import { db } from '@/lib/firebase'
+import { useProjectStore } from '@/stores/project'
 
 interface ChangedEntry {
   path: string
@@ -27,7 +21,6 @@ export function useSnapshotDiff(projectId: string) {
   const currentSnapshotId = ref<string | null>(null)
   const loading = ref(false)
 
-  let unsubProject: Unsubscribe | null = null
   let loadToken = 0
 
   async function loadFor(snapshotId: string | null): Promise<void> {
@@ -47,33 +40,45 @@ export function useSnapshotDiff(projectId: string) {
       const parentId = data?.parentSnapshotId ?? null
       hasParent.value = !!parentId
       if (parentId) {
-        const files = await getDocs(
-          collection(db, 'projects', projectId, 'snapshots', parentId, 'files'),
-        )
+        // Parent contents: content-addressed manifest (new snapshots) or the
+        // inline files subcollection (legacy snapshots).
+        const parentDoc = await getDoc(doc(db, 'projects', projectId, 'snapshots', parentId))
         if (token !== loadToken) return
-        files.forEach((d) => {
-          const x = d.data() as { path?: string; content?: string }
-          if (x.path) baseFiles[x.path] = x.content ?? ''
-        })
+        const blobs = parentDoc.data()?.blobs as { path: string; hash: string }[] | undefined
+        if (Array.isArray(blobs) && blobs.length > 0) {
+          const docs = await Promise.all(
+            blobs.map((b) => getDoc(doc(db, 'projects', projectId, 'blobs', b.hash))),
+          )
+          if (token !== loadToken) return
+          blobs.forEach((b, i) => {
+            baseFiles[b.path] = (docs[i].data()?.content as string | undefined) ?? ''
+          })
+        } else {
+          const files = await getDocs(
+            collection(db, 'projects', projectId, 'snapshots', parentId, 'files'),
+          )
+          if (token !== loadToken) return
+          files.forEach((d) => {
+            const x = d.data() as { path?: string; content?: string }
+            if (x.path) baseFiles[x.path] = x.content ?? ''
+          })
+        }
       }
     } finally {
       if (token === loadToken) loading.value = false
     }
   }
 
+  // Head pointer comes from the shared project store (no extra subscription).
+  const store = useProjectStore()
   watch(
-    () => projectId,
-    (id) => {
-      unsubProject?.()
-      unsubProject = onSnapshot(doc(db, 'projects', id), (snap) => {
-        const sid = (snap.data()?.currentSnapshotId as string | undefined) ?? null
-        currentSnapshotId.value = sid
-        void loadFor(sid)
-      })
+    () => store.currentSnapshotId,
+    (sid) => {
+      currentSnapshotId.value = sid
+      void loadFor(sid)
     },
     { immediate: true },
   )
-  onUnmounted(() => unsubProject?.())
 
   return {
     baseFiles,

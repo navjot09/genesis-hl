@@ -76,27 +76,27 @@ export function buildPreviewHtml(
   // app uses its demo fallback). JSON.stringify keeps the token out of the way
   // of any accidental </script> in content.
   const envJson = env ? JSON.stringify(env) : 'undefined'
-  return injectIntoHead(html, buildCsp(env) + buildBridge(envJson))
+  return injectIntoHead(html, buildCsp() + buildBridge(envJson))
 }
 
 /**
  * Content-Security-Policy for the preview document.
  *
- * The iframe runs UNTRUSTED generated code holding a capability token; without
- * a CSP, malicious generated JS could exfiltrate that token to any host (fetch
- * or img beacon). Lock network egress to the Genesis proxy origin only:
- *  - connect-src: the proxy origin — the app's only legitimate data channel
- *  - img/font/media: data:/blob: only, so no URL-based beacons
+ * The iframe runs UNTRUSTED generated code. With the token broker (below) the
+ * sandbox holds NO credential and needs NO network access of its own, so
+ * egress is locked down completely:
+ *  - connect-src 'none': zero direct network requests (proxy calls travel over
+ *    postMessage to the parent, which holds the real token)
+ *  - img/font/media: data:/blob: only — no URL-based beacons
  *  - form-action 'none': no form-based exfiltration
  * Inline script/style must stay allowed — the whole app is inlined into srcdoc.
  */
-function buildCsp(env: GenesisEnv | null): string {
-  const proxyOrigin = env ? new URL(env.proxyUrl).origin : "'none'"
+function buildCsp(): string {
   const policy = [
     `default-src 'none'`,
     `script-src 'unsafe-inline'`,
     `style-src 'unsafe-inline'`,
-    `connect-src ${proxyOrigin}`,
+    `connect-src 'none'`,
     `img-src data: blob:`,
     `font-src data:`,
     `media-src data: blob:`,
@@ -107,19 +107,82 @@ function buildCsp(env: GenesisEnv | null): string {
 }
 
 /**
- * The runtime injected into every preview. Exposes `window.__GENESIS__` with the
- * proxy URL + capability token, plus `onWebhook(handler)` — a realtime feed of
- * live HighLevel events (new contact, inbound message, …) polled from the
- * proxy's Genesis-internal /__events route. Generated apps just register a
- * handler; the polling loop lives here so the generated code stays trivial.
+ * The runtime injected into every preview (runs BEFORE any generated code).
+ *
+ * TOKEN BROKER: the sandbox holds no credential. `env.token` is a placeholder;
+ * window.fetch is replaced with a shim that relays proxy-bound requests to the
+ * PARENT over postMessage. The parent validates the path, attaches the real
+ * capability token, performs the network call, and posts the result back. So
+ * even fully malicious generated code has exactly one capability — asking the
+ * broker — and nothing worth exfiltrating. Existing generated apps keep
+ * working unchanged: they already call fetch(env.proxyUrl + path, ...).
+ *
+ * WATCHDOG: pings the parent every 3s; a stopped ping means the generated app
+ * froze (e.g. an infinite loop) and the parent can offer a reload.
+ *
+ * Also exposes `onWebhook(handler)` — live HighLevel events polled via the
+ * same brokered fetch.
  */
 function buildBridge(envJson: string): string {
   return `<script>
 (function () {
   var env = ${envJson};
   window.__GENESIS__ = env;
-  if (!env || !env.proxyUrl || !env.token) return;
 
+  function ping() {
+    try { parent.postMessage({ __genesis: true, kind: 'ping' }, '*'); } catch (e) {}
+  }
+  ping();
+  setInterval(ping, 3000);
+
+  if (!env || !env.proxyUrl) return;
+
+  // --- Brokered fetch -------------------------------------------------------
+  var pending = {};
+  var seq = 0;
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!d || d.__genesis !== true || d.kind !== 'hl-response') return;
+    var entry = pending[d.id];
+    if (!entry) return;
+    delete pending[d.id];
+    clearTimeout(entry.timer);
+    entry.resolve({
+      ok: d.ok,
+      status: d.status,
+      json: function () { return Promise.resolve(d.body); },
+      text: function () {
+        return Promise.resolve(typeof d.body === 'string' ? d.body : JSON.stringify(d.body));
+      },
+    });
+  });
+
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.indexOf(env.proxyUrl) !== 0) {
+      return Promise.reject(new TypeError('Network access is disabled in the preview sandbox'));
+    }
+    var id = ++seq;
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        if (pending[id]) {
+          delete pending[id];
+          reject(new TypeError('Preview bridge timed out'));
+        }
+      }, 20000);
+      pending[id] = { resolve: resolve, timer: timer };
+      parent.postMessage({
+        __genesis: true,
+        kind: 'hl-fetch',
+        id: id,
+        path: url.slice(env.proxyUrl.length),
+        method: (init && init.method) || 'GET',
+        body: init && typeof init.body === 'string' ? init.body : null,
+      }, '*');
+    });
+  };
+
+  // --- Live HighLevel webhook events (rides the brokered fetch) -------------
   var handlers = [];
   // Only surface events that arrive AFTER this preview loads.
   var since = new Date().toISOString();
@@ -127,10 +190,7 @@ function buildBridge(envJson: string): string {
 
   async function poll() {
     try {
-      var res = await fetch(
-        env.proxyUrl + '/__events?since=' + encodeURIComponent(since),
-        { headers: { Authorization: 'Bearer ' + env.token } }
-      );
+      var res = await fetch(env.proxyUrl + '/__events?since=' + encodeURIComponent(since));
       if (res.ok) {
         var body = await res.json();
         var events = (body && body.events) || [];

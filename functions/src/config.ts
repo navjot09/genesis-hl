@@ -17,6 +17,15 @@ export const PREVIEW_TOKEN_SECRET = defineSecret('PREVIEW_TOKEN_SECRET');
 
 // --- Non-secret config -----------------------------------------------------
 export const LLM_PROVIDER = defineString('LLM_PROVIDER', { default: 'gemini' });
+/**
+ * HighLevel's webhook public key, base64-encoded PEM (Developer docs →
+ * Webhooks). When set, hlWebhook verifies the x-wh-signature header and
+ * rejects forged events; when empty (e.g. local dev), verification is skipped
+ * and the known-location gate is the only guard.
+ */
+export const HL_WEBHOOK_PUBLIC_KEY_B64 = defineString('HL_WEBHOOK_PUBLIC_KEY_B64', {
+  default: '',
+});
 export const GEMINI_MODEL = defineString('GEMINI_MODEL', { default: 'gemini-flash-latest' });
 export const GEMINI_MODEL_HEAVY = defineString('GEMINI_MODEL_HEAVY', { default: 'gemini-pro-latest' });
 

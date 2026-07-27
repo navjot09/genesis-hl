@@ -12,12 +12,14 @@
  *   another. `oauthCallback` itself only bounces code+state back to the SPA — it
  *   never exchanges or links, so it needs no secret and links no account.
  */
-import { onRequest } from 'firebase-functions/v2/https';
+import { onRequest, type Request } from 'firebase-functions/v2/https';
+import type { Response } from 'express';
 import { logger } from 'firebase-functions/v2';
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { randomBytes } from 'node:crypto';
 import { db } from '../lib/admin.js';
 import { AuthError, requireFirebaseUser } from '../lib/authn.js';
+import { AppError, sendError } from '../lib/errors.js';
 import {
   APP_BASE_URL,
   HL_AUTHORIZE_BASE,
@@ -32,12 +34,19 @@ import { hlFetch } from '../hl/client.js';
 
 /** Step 1 — SPA calls this (authed); it stores `state` in sessionStorage and navigates to `url`. */
 export const hlOauthStart = onRequest({ cors: true }, async (req, res) => {
+  try {
+    await handleOauthStart(req, res);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+async function handleOauthStart(req: Request, res: Response): Promise<void> {
   let uid: string;
   try {
     ({ uid } = await requireFirebaseUser(req));
   } catch (err) {
-    res.status(401).json({ error: err instanceof AuthError ? err.message : 'Unauthorized' });
-    return;
+    throw new AppError('UNAUTHORIZED', err instanceof AuthError ? err.message : 'Sign in required');
   }
 
   const state = randomBytes(24).toString('hex');
@@ -54,7 +63,7 @@ export const hlOauthStart = onRequest({ cors: true }, async (req, res) => {
   url.searchParams.set('state', state);
 
   res.json({ url: url.toString(), state });
-});
+}
 
 /**
  * Step 2 — HighLevel redirects the browser here with ?code&state (or ?error).
@@ -89,46 +98,35 @@ export const hlOauthComplete = onRequest(
   async (req, res) => {
     let uid: string;
     try {
-      ({ uid } = await requireFirebaseUser(req));
-    } catch (err) {
-      res.status(401).json({ error: err instanceof AuthError ? err.message : 'Unauthorized' });
-      return;
-    }
+      try {
+        ({ uid } = await requireFirebaseUser(req));
+      } catch (err) {
+        throw new AppError('UNAUTHORIZED', err instanceof AuthError ? err.message : 'Sign in required');
+      }
 
-    const body = (req.body ?? {}) as { state?: unknown; code?: unknown };
-    const state = typeof body.state === 'string' ? body.state : '';
-    const code = typeof body.code === 'string' ? body.code : '';
-    if (!state || !code) {
-      res.status(400).json({ error: 'Missing state or code' });
-      return;
-    }
+      const body = (req.body ?? {}) as { state?: unknown; code?: unknown };
+      const state = typeof body.state === 'string' ? body.state : '';
+      const code = typeof body.code === 'string' ? body.code : '';
+      if (!state || !code) throw new AppError('BAD_REQUEST', 'Missing state or code');
 
-    // Resolve + consume the single-use, TTL-bound state nonce.
-    const stateRef = db.collection('oauthStates').doc(state);
-    const stateSnap = await stateRef.get();
-    if (!stateSnap.exists) {
-      res.status(400).json({ error: 'invalid_state' });
-      return;
-    }
-    const { uid: initiatorUid, createdAt } = stateSnap.data() as {
-      uid: string;
-      createdAt?: Timestamp;
-    };
-    await stateRef.delete(); // single-use regardless of outcome
+      // Resolve + consume the single-use, TTL-bound state nonce.
+      const stateRef = db.collection('oauthStates').doc(state);
+      const stateSnap = await stateRef.get();
+      if (!stateSnap.exists) throw new AppError('BAD_REQUEST', 'invalid_state');
+      const { uid: initiatorUid, createdAt } = stateSnap.data() as {
+        uid: string;
+        createdAt?: Timestamp;
+      };
+      await stateRef.delete(); // single-use regardless of outcome
 
-    const age = createdAt ? Date.now() - createdAt.toMillis() : Infinity;
-    if (age > OAUTH_STATE_TTL_MS) {
-      res.status(400).json({ error: 'state_expired' });
-      return;
-    }
-    // The CSRF guard: only the initiator, authenticated, may complete their flow.
-    if (initiatorUid !== uid) {
-      logger.warn('OAuth completer is not the initiator', { initiatorUid, completerUid: uid });
-      res.status(403).json({ error: 'state_user_mismatch' });
-      return;
-    }
+      const age = createdAt ? Date.now() - createdAt.toMillis() : Infinity;
+      if (age > OAUTH_STATE_TTL_MS) throw new AppError('BAD_REQUEST', 'state_expired');
+      // The CSRF guard: only the initiator, authenticated, may complete their flow.
+      if (initiatorUid !== uid) {
+        logger.warn('OAuth completer is not the initiator', { initiatorUid, completerUid: uid });
+        throw new AppError('FORBIDDEN', 'state_user_mismatch');
+      }
 
-    try {
       const tokens = await exchangeCode(code);
       const saved = await saveTokens(uid, tokens);
 
@@ -157,8 +155,12 @@ export const hlOauthComplete = onRequest(
 
       res.json({ connected: true, locationId: saved.locationId, locationName });
     } catch (err) {
+      if (err instanceof AppError) {
+        sendError(res, err);
+        return;
+      }
       logger.error('OAuth code exchange failed', { err: String(err) });
-      res.status(502).json({ error: 'token_exchange_failed' });
+      sendError(res, new AppError('HL_UPSTREAM', 'token_exchange_failed'));
     }
   },
 );

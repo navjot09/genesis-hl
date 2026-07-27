@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, inject, onUnmounted, reactive, ref, watch } from 'vue'
-import { collection, onSnapshot, type Unsubscribe } from 'firebase/firestore'
+import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   Loader2Icon,
   MonitorIcon,
   MonitorPlayIcon,
   RefreshCwIcon,
 } from '@lucide/vue'
-import { db, functionsBaseUrl } from '@/lib/firebase'
+import { functionsBaseUrl } from '@/lib/firebase'
+import { useProjectStore } from '@/stores/project'
 import { authedJson } from '@/lib/api'
 import { buildPreviewHtml, type GenesisEnv } from '@/lib/preview'
 import { GenerationKey } from '@/composables/useGeneration'
@@ -15,7 +15,7 @@ import { useHlConnection } from '@/composables/useHlConnection'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 
-const props = defineProps<{ projectId: string }>()
+defineProps<{ projectId: string }>()
 
 const injected = inject(GenerationKey)
 if (!injected) throw new Error('PreviewPanel must be used inside a workspace that provides generation state')
@@ -23,37 +23,14 @@ const generation = injected
 const { connection } = useHlConnection()
 
 // --- Committed files (the preview always renders the SAVED app) -------------
-const files = reactive<Record<string, string>>({})
-const filesLoaded = ref(false)
-let unsub: Unsubscribe | null = null
-
-watch(
-  () => props.projectId,
-  (id) => {
-    unsub?.()
-    for (const k of Object.keys(files)) delete files[k]
-    filesLoaded.value = false
-    unsub = onSnapshot(
-      collection(db, 'projects', id, 'files'),
-      (snap) => {
-        const seen = new Set<string>()
-        for (const d of snap.docs) {
-          const data = d.data() as { path?: string; content?: string }
-          if (!data.path) continue
-          files[data.path] = data.content ?? ''
-          seen.add(data.path)
-        }
-        for (const p of Object.keys(files)) if (!seen.has(p)) delete files[p]
-        filesLoaded.value = true
-      },
-      () => {
-        filesLoaded.value = true
-      },
-    )
-  },
-  { immediate: true },
-)
-onUnmounted(() => unsub?.())
+// Read from the shared project store — no second Firestore subscription.
+const store = useProjectStore()
+const files = computed<Record<string, string>>(() => {
+  const out: Record<string, string> = {}
+  for (const [path, f] of Object.entries(store.files)) out[path] = f.content
+  return out
+})
+const filesLoaded = computed(() => !store.filesLoading)
 
 // --- Preview build ---------------------------------------------------------
 const srcdoc = ref('')
@@ -64,11 +41,11 @@ const noEntry = ref(false)
 const previewToken = ref<string | null>(null)
 const tokenExpiry = ref(0)
 
-const fileCount = computed(() => Object.keys(files).length)
+const fileCount = computed(() => Object.keys(files.value).length)
 const hasFiles = computed(() => fileCount.value > 0)
 // Signature that changes whenever committed content changes (drives auto-rebuild).
 const filesSignature = computed(() =>
-  Object.entries(files)
+  Object.entries(files.value)
     .map(([p, c]) => `${p}:${c.length}`)
     .sort()
     .join('|'),
@@ -95,11 +72,13 @@ async function rebuild(): Promise<void> {
   building.value = true
   noEntry.value = false
   try {
-    const token = await ensureToken()
-    const env: GenesisEnv | null = token
-      ? { proxyUrl: `${functionsBaseUrl}/hlProxy`, token }
+    // TOKEN BROKER: the iframe gets NO credential. `token` is a placeholder —
+    // the bridge relays proxy calls here via postMessage and THIS component
+    // attaches the real capability token (see onBridgeMessage below).
+    const env: GenesisEnv | null = connection.value.connected
+      ? { proxyUrl: `${functionsBaseUrl}/hlProxy`, token: 'brokered' }
       : null
-    const html = buildPreviewHtml({ ...files }, env)
+    const html = buildPreviewHtml({ ...files.value }, env)
     if (html === null) {
       noEntry.value = true
       srcdoc.value = ''
@@ -107,10 +86,90 @@ async function rebuild(): Promise<void> {
     }
     srcdoc.value = html
     buildKey.value++
+    lastPing.value = Date.now()
+    frozen.value = false
   } finally {
     building.value = false
   }
 }
+
+// --- Token broker + watchdog (parent side) ---------------------------------
+const iframeEl = ref<HTMLIFrameElement | null>(null)
+const lastPing = ref(Date.now())
+const frozen = ref(false)
+let frozenTimer: ReturnType<typeof setInterval> | null = null
+
+interface BridgeFetchMsg {
+  __genesis: true
+  kind: 'hl-fetch'
+  id: number
+  path: unknown
+  method: unknown
+  body: unknown
+}
+
+function onBridgeMessage(ev: MessageEvent): void {
+  // Only OUR iframe may talk to the broker.
+  if (!iframeEl.value || ev.source !== iframeEl.value.contentWindow) return
+  const d = ev.data as { __genesis?: boolean; kind?: string }
+  if (d?.__genesis !== true) return
+  if (d.kind === 'ping') {
+    lastPing.value = Date.now()
+    frozen.value = false
+    return
+  }
+  if (d.kind === 'hl-fetch') void handleBridgeFetch(ev.data as BridgeFetchMsg)
+}
+
+async function handleBridgeFetch(msg: BridgeFetchMsg): Promise<void> {
+  const reply = (payload: { ok: boolean; status: number; body: unknown }): void => {
+    // Opaque-origin iframes can only be addressed with targetOrigin '*'; the
+    // source check above guarantees the recipient is our own preview frame.
+    iframeEl.value?.contentWindow?.postMessage(
+      { __genesis: true, kind: 'hl-response', id: msg.id, ...payload },
+      '*',
+    )
+  }
+  const path = typeof msg.path === 'string' ? msg.path : ''
+  const method = typeof msg.method === 'string' ? msg.method.toUpperCase() : 'GET'
+  if (!path.startsWith('/') || path.includes('://') || path.length > 500) {
+    reply({ ok: false, status: 400, body: { error: 'Invalid path' } })
+    return
+  }
+  try {
+    const token = await ensureToken()
+    if (!token) {
+      reply({ ok: false, status: 401, body: { error: 'HighLevel is not connected' } })
+      return
+    }
+    const body = typeof msg.body === 'string' ? msg.body : undefined
+    const res = await fetch(`${functionsBaseUrl}/hlProxy${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body,
+    })
+    reply({ ok: res.ok, status: res.status, body: await res.json().catch(() => null) })
+  } catch {
+    reply({ ok: false, status: 502, body: { error: 'Proxy call failed' } })
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('message', onBridgeMessage)
+  // Watchdog: pings stop => the generated app froze (infinite loop etc).
+  frozenTimer = setInterval(() => {
+    if (srcdoc.value && !generation.generating.value && Date.now() - lastPing.value > 10_000) {
+      frozen.value = true
+    }
+  }, 5_000)
+})
+onUnmounted(() => {
+  window.removeEventListener('message', onBridgeMessage)
+  if (frozenTimer) clearInterval(frozenTimer)
+})
 
 function forceRefresh(): void {
   previewToken.value = null // re-mint a fresh capability token
@@ -171,12 +230,31 @@ watch(filesLoaded, (loaded) => {
            blanks out; it re-renders once the new files are committed. -->
       <iframe
         v-if="srcdoc"
+        ref="iframeEl"
         :key="buildKey"
         :srcdoc="srcdoc"
-        sandbox="allow-scripts allow-forms allow-popups allow-modals"
+        sandbox="allow-scripts allow-forms allow-modals"
+        allow="accelerometer 'none'; camera 'none'; geolocation 'none'; gyroscope 'none'; microphone 'none'; midi 'none'; payment 'none'; usb 'none'"
+        referrerpolicy="no-referrer"
         class="h-full w-full border-0 bg-white"
         title="Live preview of the generated app"
       />
+
+      <!-- Watchdog: the generated app stopped responding (likely an infinite loop) -->
+      <div
+        v-if="frozen && !generation.generating.value"
+        class="pointer-events-none absolute inset-x-0 top-0 flex justify-center p-3"
+      >
+        <div
+          class="pointer-events-auto flex items-center gap-2 rounded-full border bg-background/90 px-3 py-1 text-xs shadow-sm backdrop-blur"
+        >
+          <span class="size-1.5 rounded-full bg-red-500" />
+          App unresponsive
+          <button type="button" class="font-medium underline underline-offset-2" @click="forceRefresh">
+            Reload
+          </button>
+        </div>
+      </div>
 
       <!-- Non-blocking "updating" pill over the previous preview -->
       <div

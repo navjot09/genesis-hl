@@ -4,8 +4,9 @@
  * header; on an unexpected 401 performs exactly one locked refresh-and-retry.
  */
 import { HL_API_BASE } from '../config.js';
-import { hlVersionForPath } from './constants.js';
+import { HL_REQUEST_TIMEOUT_MS, hlVersionForPath } from './constants.js';
 import { ensureFreshToken } from './tokens.js';
+import { fetchWithTimeoutRetry } from '../lib/httpRetry.js';
 
 export interface HlResponse {
   status: number;
@@ -29,16 +30,27 @@ export async function hlFetch(uid: string, reqSpec: HlRequest): Promise<HlRespon
       for (const item of Array.isArray(v) ? v : [v]) url.searchParams.append(k, item);
     }
 
-    const res = await fetch(url, {
-      method: reqSpec.method,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Version: hlVersionForPath(reqSpec.path),
-        Accept: 'application/json',
-        ...(reqSpec.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    // Timeout always; retry ONLY idempotent reads (a retried send could
+    // double-message a real customer).
+    const idempotent = reqSpec.method === 'GET';
+    const res = await fetchWithTimeoutRetry(
+      url,
+      {
+        method: reqSpec.method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Version: hlVersionForPath(reqSpec.path),
+          Accept: 'application/json',
+          ...(reqSpec.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: reqSpec.body !== undefined ? JSON.stringify(reqSpec.body) : undefined,
       },
-      body: reqSpec.body !== undefined ? JSON.stringify(reqSpec.body) : undefined,
-    });
+      {
+        timeoutMs: HL_REQUEST_TIMEOUT_MS,
+        retries: idempotent ? 1 : 0,
+        retryOnStatuses: idempotent ? [502, 503, 504] : [],
+      },
+    );
 
     const body: unknown = await res.json().catch(() => ({}));
     return { status: res.status, body };

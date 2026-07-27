@@ -7,109 +7,135 @@
  * undoable, and the timeline never branches.
  */
 import { onRequest } from 'firebase-functions/v2/https';
-import { logger } from 'firebase-functions/v2';
+import { z } from 'zod';
 import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../lib/admin.js';
 import { AuthError, requireFirebaseUser } from '../lib/authn.js';
-import { fileDocId } from './snapshots.js';
+import { AppError, sendError } from '../lib/errors.js';
+import { fileDocId, writeBlobs } from './snapshots.js';
+import { planBlobs, type BlobEntry } from './contentStore.js';
+
+const RestoreRequest = z.object({
+  projectId: z.string().min(1),
+  snapshotId: z.string().min(1),
+});
 
 export const restoreSnapshot = onRequest({ cors: true }, async (req, res) => {
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Use POST' });
-    return;
-  }
-
-  let uid: string;
   try {
-    ({ uid } = await requireFirebaseUser(req));
-  } catch (err) {
-    res.status(401).json({ error: err instanceof AuthError ? err.message : 'Unauthorized' });
-    return;
-  }
+    if (req.method !== 'POST') throw new AppError('BAD_REQUEST', 'Use POST');
 
-  const body = (req.body ?? {}) as { projectId?: unknown; snapshotId?: unknown };
-  const projectId = typeof body.projectId === 'string' ? body.projectId : '';
-  const snapshotId = typeof body.snapshotId === 'string' ? body.snapshotId : '';
-  if (!projectId || !snapshotId) {
-    res.status(400).json({ error: 'projectId and snapshotId are required' });
-    return;
-  }
+    let uid: string;
+    try {
+      ({ uid } = await requireFirebaseUser(req));
+    } catch (err) {
+      throw new AppError('UNAUTHORIZED', err instanceof AuthError ? err.message : 'Sign in required');
+    }
 
-  const projRef = db.collection('projects').doc(projectId);
-  const proj = await projRef.get();
-  const projData = proj.data() as { ownerUid?: string; currentSnapshotId?: string } | undefined;
-  if (!proj.exists || projData?.ownerUid !== uid) {
-    res.status(403).json({ error: 'Project not found or not yours' });
-    return;
-  }
+    const parsed = RestoreRequest.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      throw new AppError('BAD_REQUEST', parsed.error.issues[0]?.message ?? 'Invalid request');
+    }
+    const { projectId, snapshotId } = parsed.data;
 
-  const targetRef = projRef.collection('snapshots').doc(snapshotId);
-  const target = await targetRef.get();
-  if (!target.exists) {
-    res.status(404).json({ error: 'Snapshot not found' });
-    return;
-  }
+    const projRef = db.collection('projects').doc(projectId);
+    const targetRef = projRef.collection('snapshots').doc(snapshotId);
+    const newSnapRef = projRef.collection('snapshots').doc();
 
-  // Files as they were at the target snapshot.
-  const targetFilesSnap = await targetRef.collection('files').get();
-  const files: Record<string, string> = {};
-  targetFilesSnap.forEach((d) => {
-    const x = d.data() as { path: string; content: string };
-    files[x.path] = x.content ?? '';
-  });
+    // --- Pre-transaction: ownership, then resolve the target's contents. ----
+    // Snapshots and blobs are IMMUTABLE, so reading them outside the
+    // transaction is safe; only the head pointer / working set need txn rigor.
+    const projPre = await projRef.get();
+    // 404 (not 403) for unowned projects: don't confirm existence to non-owners.
+    if (!projPre.exists || (projPre.data() as { ownerUid?: string }).ownerUid !== uid) {
+      throw new AppError('NOT_FOUND', 'Project not found');
+    }
+    const target = await targetRef.get();
+    if (!target.exists) throw new AppError('NOT_FOUND', 'Snapshot not found');
+    const targetData = target.data() as { prompt?: string; blobs?: BlobEntry[] };
+    const targetPrompt = targetData.prompt ?? 'a previous version';
 
-  // Current working files (to know which to delete on restore).
-  const workingSnap = await projRef.collection('files').get();
-  const currentPaths: string[] = [];
-  workingSnap.forEach((d) => currentPaths.push((d.data() as { path: string }).path));
+    // Files as they were at the target snapshot: content-addressed manifest
+    // (new format) or inline files subcollection (legacy snapshots).
+    const files: Record<string, string> = {};
+    let entries: BlobEntry[];
+    if (Array.isArray(targetData.blobs) && targetData.blobs.length > 0) {
+      entries = targetData.blobs;
+      const blobRefs = entries.map((e) => projRef.collection('blobs').doc(e.hash));
+      const blobDocs = await db.getAll(...blobRefs);
+      entries.forEach((e, i) => {
+        const content = blobDocs[i].data()?.content as string | undefined;
+        if (content === undefined) throw new AppError('INTERNAL', 'Snapshot content missing');
+        files[e.path] = content;
+      });
+    } else {
+      const targetFilesSnap = await targetRef.collection('files').get();
+      targetFilesSnap.forEach((d) => {
+        const x = d.data() as { path: string; content: string };
+        files[x.path] = x.content ?? '';
+      });
+      // Migrate this legacy snapshot's contents into blob storage so the NEW
+      // snapshot is manifest-based like everything going forward.
+      const plan = planBlobs(files, undefined);
+      await writeBlobs(projectId, plan.toWrite);
+      entries = plan.entries;
+    }
 
-  const targetPrompt = (target.data() as { prompt?: string }).prompt ?? 'a previous version';
-  const newSnapRef = projRef.collection('snapshots').doc();
-  const batch = db.batch();
+    // --- Transaction: head pointer + working set flip, atomically. ----------
+    const outcome = await db.runTransaction(async (tx) => {
+      const [proj, workingSnap] = await Promise.all([
+        tx.get(projRef),
+        tx.get(projRef.collection('files')),
+      ]);
+      const projData = proj.data() as
+        | { ownerUid?: string; currentSnapshotId?: string }
+        | undefined;
+      if (!proj.exists || projData?.ownerUid !== uid) {
+        throw new AppError('NOT_FOUND', 'Project not found');
+      }
+      const currentPaths = workingSnap.docs.map((d) => (d.data() as { path: string }).path);
 
-  // 1. New immutable snapshot recording the restore.
-  batch.set(newSnapRef, {
-    parentSnapshotId: projData?.currentSnapshotId ?? null,
-    prompt: `Restored: ${targetPrompt.slice(0, 60)}`,
-    restoredFrom: snapshotId,
-    createdAt: FieldValue.serverTimestamp(),
-    manifest: Object.keys(files),
-    changed: Object.keys(files).map((p) => ({ path: p, op: 'write' })),
-  });
-  for (const [path, content] of Object.entries(files)) {
-    batch.set(newSnapRef.collection('files').doc(fileDocId(path)), { path, content });
-  }
+      // 1. New immutable snapshot recording the restore — REUSES the target's
+      //    content hashes: a restore writes a manifest, never file copies.
+      tx.set(newSnapRef, {
+        parentSnapshotId: projData?.currentSnapshotId ?? null,
+        prompt: `Restored: ${targetPrompt.slice(0, 60)}`,
+        restoredFrom: snapshotId,
+        createdAt: FieldValue.serverTimestamp(),
+        manifest: Object.keys(files),
+        blobs: entries,
+        changed: Object.keys(files).map((p) => ({ path: p, op: 'write' })),
+      });
 
-  // 2. Working set becomes the target's files (add/overwrite, delete the rest).
-  for (const [path, content] of Object.entries(files)) {
-    batch.set(projRef.collection('files').doc(fileDocId(path)), {
-      path,
-      content,
-      updatedAt: FieldValue.serverTimestamp(),
+      // 2. Working set becomes the target's files (add/overwrite, delete the rest).
+      for (const [path, content] of Object.entries(files)) {
+        tx.set(projRef.collection('files').doc(fileDocId(path)), {
+          path,
+          content,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      for (const path of currentPaths) {
+        if (!(path in files)) tx.delete(projRef.collection('files').doc(fileDocId(path)));
+      }
+
+      // 3. Move the head + a chat note so the restore shows in history.
+      tx.set(
+        projRef,
+        { currentSnapshotId: newSnapRef.id, updatedAt: FieldValue.serverTimestamp() },
+        { merge: true },
+      );
+      tx.set(projRef.collection('messages').doc(), {
+        role: 'assistant',
+        content: `Restored the project to an earlier version (${targetPrompt.slice(0, 60)}).`,
+        snapshotId: newSnapRef.id,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      return { fileCount: Object.keys(files).length };
     });
-  }
-  for (const path of currentPaths) {
-    if (!(path in files)) batch.delete(projRef.collection('files').doc(fileDocId(path)));
-  }
 
-  // 3. Move the head + a chat note so the restore shows in history.
-  batch.set(
-    projRef,
-    { currentSnapshotId: newSnapRef.id, updatedAt: FieldValue.serverTimestamp() },
-    { merge: true },
-  );
-  batch.set(projRef.collection('messages').doc(), {
-    role: 'assistant',
-    content: `Restored the project to an earlier version (${targetPrompt.slice(0, 60)}).`,
-    snapshotId: newSnapRef.id,
-    createdAt: FieldValue.serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
-    res.json({ ok: true, snapshotId: newSnapRef.id, fileCount: Object.keys(files).length });
+    res.json({ ok: true, snapshotId: newSnapRef.id, fileCount: outcome.fileCount });
   } catch (err) {
-    logger.error('Restore failed', { err: String(err) });
-    res.status(500).json({ error: 'Failed to restore snapshot' });
+    sendError(res, err);
   }
 });

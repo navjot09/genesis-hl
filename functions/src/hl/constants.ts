@@ -26,8 +26,20 @@ export function hlVersionForPath(path: string): string {
 /** How long before expiry we proactively refresh the access token. */
 export const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
-/** A concurrent refresher's lock is considered stale after this long. */
-export const REFRESH_LOCK_TTL_MS = 30 * 1000;
+/**
+ * A concurrent refresher's lock is considered stale after this long. MUST be
+ * far larger than REFRESH_HTTP_TIMEOUT_MS: a live holder can never hold the
+ * lock longer than its HTTP timeout, so takeover only ever happens from a
+ * provably dead holder — never a slow-but-alive one (which would double-use
+ * the single-use refresh token and permanently brick the grant).
+ */
+export const REFRESH_LOCK_TTL_MS = 120 * 1000;
+
+/** Hard timeout for calls to HL's token endpoint (never auto-retried). */
+export const REFRESH_HTTP_TIMEOUT_MS = 15 * 1000;
+
+/** Timeout for regular HL API calls via the proxy. */
+export const HL_REQUEST_TIMEOUT_MS = 10 * 1000;
 
 /** OAuth `state` documents older than this are rejected (CSRF window). */
 export const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;

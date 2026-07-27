@@ -16,6 +16,9 @@ import { logger } from 'firebase-functions/v2';
 import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../lib/admin.js';
 import { checkRateLimit } from '../lib/rateLimit.js';
+import { HL_WEBHOOK_PUBLIC_KEY_B64 } from '../config.js';
+import { verifyHlSignature } from './verify.js';
+import { RATE_WINDOWS } from '../config/limits.js';
 
 /** Best-effort extraction of the location id from a variety of HL payload shapes. */
 function extractLocationId(body: Record<string, unknown>): string | null {
@@ -28,6 +31,20 @@ export const hlWebhook = onRequest({ cors: false, timeoutSeconds: 30 }, async (r
   if (req.method !== 'POST') {
     res.status(405).send('Use POST');
     return;
+  }
+
+  // Authenticity gate: when HL's public key is configured, the RSA signature
+  // over the RAW body must verify — forged events are rejected outright.
+  const keyB64 = HL_WEBHOOK_PUBLIC_KEY_B64.value();
+  if (keyB64) {
+    const signature = req.get('x-wh-signature') ?? '';
+    const rawBody =
+      (req as unknown as { rawBody?: Buffer }).rawBody ?? Buffer.from(JSON.stringify(req.body ?? {}));
+    const publicKeyPem = Buffer.from(keyB64, 'base64').toString('utf8');
+    if (!verifyHlSignature(rawBody, signature, publicKeyPem)) {
+      res.status(401).json({ error: 'invalid signature' });
+      return;
+    }
   }
 
   const body = (req.body ?? {}) as Record<string, unknown>;
@@ -56,7 +73,7 @@ export const hlWebhook = onRequest({ cors: false, timeoutSeconds: 30 }, async (r
 
   // Storage-cost cap per location: even a legitimate location can't flood
   // Firestore (120 events/min is far above HL's real emission rate).
-  const rl = await checkRateLimit(locationId, 'webhook-ingest', 120, 60_000);
+  const rl = await checkRateLimit(locationId, 'webhook-ingest', RATE_WINDOWS.webhookIngest.limit, RATE_WINDOWS.webhookIngest.windowMs);
   if (!rl.allowed) {
     res.status(200).json({ ok: true, ignored: 'rate limited' });
     return;

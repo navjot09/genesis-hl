@@ -1,5 +1,7 @@
 # Genesis — AI-Powered HighLevel App Builder
 
+[![CI](https://github.com/navjot09/genesis-hl/actions/workflows/ci.yml/badge.svg)](https://github.com/navjot09/genesis-hl/actions/workflows/ci.yml)
+
 Genesis is a Lovable/Bolt-style AI app builder specialized for **HighLevel marketplace apps**.
 A user signs in, connects their HighLevel account via OAuth, creates a project, and describes an app
 in chat. An LLM streams a working app to the browser in real time; the generated code calls **real
@@ -91,10 +93,10 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
   secret on the endpoint (see the provider note above for honest scope).
 - **Marker file protocol (with eyes open).** The model emits `<file path="…" op="…">…</file>` in a
   plain-text stream, parsed incrementally (unit-tested: attribute drift, malformed-tag recovery,
-  chunk-boundary splits) then validated with Zod. Known trade-off: text markers carry the full
-  correctness burden and cannot escape their own delimiter — Gemini's newer streamed function calling
-  (`streamFunctionCallArguments`) removes that class entirely and is the planned migration (see
-  "What I would improve").
+  chunk-boundary splits) then validated with Zod. Function calling was evaluated with live probes
+  (`scripts/probe-fc-streaming.mjs`): argument streaming is unavailable on the developer API, so
+  structured calls would lose the live-typing UX — decision + revisit triggers in
+  [docs/adr/0001-file-wire-format.md](docs/adr/0001-file-wire-format.md).
 - **Fast incremental edits.** Small changes use `op="edit"` with `SEARCH/REPLACE` hunks instead of
   re-emitting whole files — ~10× less output. Hunks apply **strictly**: matches are line-anchored and
   must be unique, so an ambiguous edit fails loudly (surfaced as a warning) rather than silently
@@ -133,7 +135,9 @@ proxy + rotating-token refresh offline — point `HL_API_BASE`/`HL_AUTHORIZE_BAS
 
 ## Testing & CI
 
-- **78 unit tests** (vitest) over the correctness-critical pure logic: the streaming marker parser
+- **91 unit tests** (vitest) over the correctness-critical logic: the generation engine's
+  continuation loop (scripted fake provider: mid-file drops, resume conversations, retry budget),
+  the streaming marker parser
   (chunk-boundary splits, attribute drift, malformed-tag recovery), the search/replace edit applier
   (line anchoring, uniqueness, whitespace tolerance), the proxy allowlist (traversal, method/paths,
   reserved literals), and the prose heuristics. One `it.skip` documents the known `</file>`-in-content
@@ -151,10 +155,9 @@ npm run lint                      # eslint over functions/src + frontend/src
 
 - **Durable generation jobs.** Today the SSE request *is* the job; make generation a background job so a
   dropped client can reconnect and resume, with a queue for concurrency.
-- **Migrate the wire format to Gemini's streamed function calling** (`streamFunctionCallArguments`)
-  — structured file ops with JSON escaping and per-field streaming would delete the marker parser,
-  the prose sanitizer, and the delimiter-collision class entirely, and enable error-feedback retry
-  loops for failed edits.
+- **Adopt structured `edit_file` function calls for edits** (edits never stream visibly, so nothing
+  is lost) to enable an error-feedback retry loop for failed hunks; full function-calling migration
+  is blocked on Google shipping argument streaming for the developer API (ADR 0001).
 - **Verify HL's webhook signature** on `hlWebhook` (today: known-location gate + ingest rate cap;
   production should validate HL's RSA-signed payload), and add **App Check + email verification** in
   front of the auth surface.

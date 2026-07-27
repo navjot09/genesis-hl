@@ -15,14 +15,24 @@
     "lint:fix": "eslint functions/src frontend/src --fix",
     "format": "prettier --check \"functions/src/**/*.ts\" \"frontend/src/**/*.{ts,vue}\"",
     "format:fix": "prettier --write \"functions/src/**/*.ts\" \"frontend/src/**/*.{ts,vue}\"",
-    "test": "npm --prefix functions run test"
+    "test": "npm --prefix functions run test",
+    "prepare": "husky",
+    "test:coverage": "npm --prefix functions run test:coverage"
   },
   "devDependencies": {
     "@vue/eslint-config-typescript": "^14.9.0",
     "eslint": "^9.39.5",
     "eslint-plugin-vue": "^10.10.0",
     "firebase-tools": "^15.23.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.2.0",
     "prettier": "^3.9.6",
     "typescript-eslint": "^8.65.0"
+  },
+  "lint-staged": {
+    "*.{ts,vue,mjs}": "eslint --fix"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

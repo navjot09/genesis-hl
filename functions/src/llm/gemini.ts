@@ -13,6 +13,8 @@ import type {
   LlmStopReason,
   LlmStreamResult,
 } from './types.js';
+import { nextWithStallTimeout } from './stall.js';
+import { LIMITS } from '../config/limits.js';
 
 export class GeminiProvider implements LLMProvider {
   readonly name = 'gemini';
@@ -49,7 +51,22 @@ export class GeminiProvider implements LLMProvider {
         },
       });
 
-      for await (const chunk of stream) {
+      const iterator = stream[Symbol.asyncIterator]();
+      for (;;) {
+        // A stream that stalls silently (socket open, no data) must become a
+        // normal transient failure — the engine's continuation logic resumes it.
+        const step = await nextWithStallTimeout(iterator, LIMITS.llmStallMs);
+        if (step === 'stalled') {
+          void iterator.return?.(undefined as never)?.catch(() => undefined);
+          return {
+            text: full,
+            stopReason: 'error',
+            detail: `stream stalled: no data for ${LIMITS.llmStallMs / 1000}s (timeout)`,
+            usage: { inputTokens, outputTokens },
+          };
+        }
+        if (step.done) break;
+        const chunk = step.value;
         if (params.signal?.aborted) {
           return { text: full, stopReason: 'aborted', detail: 'client aborted' };
         }

@@ -15,7 +15,8 @@
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../lib/admin.js';
 import { HL_API_BASE, HL_CLIENT_ID, HL_CLIENT_SECRET, HL_REDIRECT_URI } from '../config.js';
-import { REFRESH_LOCK_TTL_MS, TOKEN_REFRESH_MARGIN_MS } from './constants.js';
+import { randomUUID } from 'node:crypto';
+import { REFRESH_HTTP_TIMEOUT_MS, REFRESH_LOCK_TTL_MS, TOKEN_REFRESH_MARGIN_MS } from './constants.js';
 
 export interface HlTokenDoc {
   accessToken: string;
@@ -27,6 +28,8 @@ export interface HlTokenDoc {
   scope?: string;
   userType?: string;
   refreshLockAt?: Timestamp | null;
+  /** Random id of the caller holding the refresh lock (owner-checked writes). */
+  refreshLockOwner?: string | null;
   updatedAt?: Timestamp;
 }
 
@@ -50,12 +53,25 @@ export class HlAuthError extends Error {
 const tokenRef = (uid: string) => db.collection('hlTokens').doc(uid);
 
 async function postTokenEndpoint(body: Record<string, string>): Promise<HlTokenResponse> {
-  const res = await fetch(`${HL_API_BASE.value()}/oauth/token`, {
-    method: 'POST',
-    // HL's token endpoint expects form-encoding (its docs are inconsistent; form works).
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-    body: new URLSearchParams(body).toString(),
-  });
+  // Hard timeout, and callers must NEVER blindly retry a refresh POST: the
+  // refresh token is single-use, so a retry after an ambiguous failure could
+  // double-spend it. Bounding the call also upper-bounds how long a live lock
+  // holder can exist — the foundation of the lock-takeover safety argument.
+  let res: Response;
+  try {
+    res = await fetch(`${HL_API_BASE.value()}/oauth/token`, {
+      method: 'POST',
+      // HL's token endpoint expects form-encoding (its docs are inconsistent; form works).
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams(body).toString(),
+      signal: AbortSignal.timeout(REFRESH_HTTP_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if ((err as Error).name === 'TimeoutError' || (err as Error).name === 'AbortError') {
+      throw new HlAuthError(`HL token endpoint timed out after ${REFRESH_HTTP_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
     throw new HlAuthError(
@@ -104,6 +120,7 @@ export async function saveTokens(uid: string, t: HlTokenResponse): Promise<HlTok
     scope: t.scope,
     userType: t.userType,
     refreshLockAt: null,
+    refreshLockOwner: null,
   };
   const write: Record<string, unknown> = { updatedAt: FieldValue.serverTimestamp() };
   for (const [k, v] of Object.entries(doc)) {
@@ -143,8 +160,17 @@ export async function ensureFreshToken(
     const lockAgeMs = d.refreshLockAt ? Date.now() - d.refreshLockAt.toMillis() : Infinity;
     if (lockAgeMs < REFRESH_LOCK_TTL_MS) return { action: 'wait' as const };
 
-    tx.update(tokenRef(uid), { refreshLockAt: Timestamp.now() });
-    return { action: 'refresh' as const, refreshToken: d.refreshToken, locationId: d.locationId };
+    // Claim the lock with an OWNER id: only the owner may persist the rotated
+    // tokens or release the lock, so a stalled zombie can never clobber the
+    // state after being superseded.
+    const owner = randomUUID();
+    tx.update(tokenRef(uid), { refreshLockAt: Timestamp.now(), refreshLockOwner: owner });
+    return {
+      action: 'refresh' as const,
+      refreshToken: d.refreshToken,
+      locationId: d.locationId,
+      owner,
+    };
   });
 
   switch (claim.action) {
@@ -172,18 +198,66 @@ export async function ensureFreshToken(
     case 'refresh': {
       try {
         const t = await refreshWithHl(claim.refreshToken);
-        const saved = await saveTokens(uid, {
+        const saved = await saveTokensIfOwner(uid, claim.owner, {
           ...t,
           // Some responses omit locationId on refresh — keep the original.
           locationId: t.locationId ?? claim.locationId,
         });
         return { accessToken: saved.accessToken, locationId: saved.locationId };
       } catch (err) {
-        await tokenRef(uid).update({ refreshLockAt: null }).catch(() => undefined);
+        await releaseLockIfOwner(uid, claim.owner);
         throw err instanceof HlAuthError
           ? err
           : new HlAuthError(`Refresh failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
+}
+
+/**
+ * Persist a refresh result ONLY if we still own the lock. If a zombie holder
+ * was superseded (should be impossible while the HTTP timeout < lock TTL, but
+ * defense in depth), its stale result must not overwrite newer tokens.
+ */
+async function saveTokensIfOwner(
+  uid: string,
+  owner: string,
+  t: HlTokenResponse,
+): Promise<HlTokenDoc> {
+  const doc: HlTokenDoc = {
+    accessToken: t.access_token,
+    refreshToken: t.refresh_token,
+    expiresAt: Date.now() + t.expires_in * 1000,
+    locationId: t.locationId ?? '',
+    companyId: t.companyId,
+    scope: t.scope,
+    userType: t.userType,
+    refreshLockAt: null,
+    refreshLockOwner: null,
+  };
+  const persisted = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(tokenRef(uid));
+    if ((snap.data() as HlTokenDoc | undefined)?.refreshLockOwner !== owner) return false;
+    const write: Record<string, unknown> = { updatedAt: FieldValue.serverTimestamp() };
+    for (const [k, v] of Object.entries(doc)) {
+      if (v !== undefined) write[k] = v;
+    }
+    tx.set(tokenRef(uid), write, { merge: true });
+    return true;
+  });
+  if (!persisted) {
+    throw new HlAuthError('Refresh superseded by a concurrent refresh — retry the request');
+  }
+  return doc;
+}
+
+/** Release the lock, but only if we still own it. */
+async function releaseLockIfOwner(uid: string, owner: string): Promise<void> {
+  await db
+    .runTransaction(async (tx) => {
+      const snap = await tx.get(tokenRef(uid));
+      if ((snap.data() as HlTokenDoc | undefined)?.refreshLockOwner !== owner) return;
+      tx.update(tokenRef(uid), { refreshLockAt: null, refreshLockOwner: null });
+    })
+    .catch(() => undefined);
 }

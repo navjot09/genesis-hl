@@ -65,6 +65,13 @@ service cloud.firestore {
         allow update, delete: if false;
       }
 
+      // Content-addressed blobs — immutable file contents, written by the
+      // backend; the owner reads them to resolve snapshot manifests (diff view).
+      match /blobs/{hash} {
+        allow read: if ownsProject(projectId);
+        allow write: if false;
+      }
+
       // Snapshots — immutable, backend-written; owner may read.
       match /snapshots/{snapshotId} {
         allow read: if ownsProject(projectId);
@@ -75,6 +82,18 @@ service cloud.firestore {
           allow write: if false;
         }
       }
+    }
+
+    // --- Generation job records -------------------------------------------
+    // Written by the backend; a user may READ their own runs (observability).
+    match /generations/{generationId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow write: if false;
+    }
+
+    // --- Rate-limit counters (backend only) --------------------------------
+    match /rateLimits/{docId} {
+      allow read, write: if false;
     }
 
     // --- OAuth state (backend only) ---------------------------------------

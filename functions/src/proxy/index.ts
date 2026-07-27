@@ -11,7 +11,7 @@
  * the request. Any caller-supplied locationId that disagrees is rejected; when
  * absent, the proxy injects the right one (generated code stays simple).
  */
-import { onRequest } from 'firebase-functions/v2/https';
+import { onRequest, type Request } from 'firebase-functions/v2/https';
 import type { Response } from 'express';
 import { db } from '../lib/admin.js';
 import { bearerToken, requireFirebaseUser } from '../lib/authn.js';
@@ -21,6 +21,9 @@ import { HlAuthError } from '../hl/tokens.js';
 import { matchRule } from './allowlist.js';
 import { mintPreviewJwt, verifyPreviewJwt } from './preview.js';
 import { checkRateLimit } from '../lib/rateLimit.js';
+import { AppError, sendError } from '../lib/errors.js';
+import { RATE_WINDOWS } from '../config/limits.js';
+import { UserDocSchema, zodConverter } from '../lib/typedFirestore.js';
 
 /**
  * Endpoints with real-world side effects (messages sent to actual customers,
@@ -37,22 +40,25 @@ function hasSideEffects(method: string, hlPath: string): boolean {
 export const mintPreviewToken = onRequest(
   { cors: true, secrets: [PREVIEW_TOKEN_SECRET] },
   async (req, res) => {
-    let uid: string;
     try {
-      ({ uid } = await requireFirebaseUser(req));
-    } catch {
-      res.status(401).json({ error: 'Unauthorized' });
-      return;
-    }
+      let uid: string;
+      try {
+        ({ uid } = await requireFirebaseUser(req));
+      } catch {
+        throw new AppError('UNAUTHORIZED', 'Sign in required');
+      }
 
-    const user = await db.collection('users').doc(uid).get();
-    const hl = user.data()?.hl as { connected?: boolean; locationId?: string } | undefined;
-    if (!hl?.connected || !hl.locationId) {
-      res.status(409).json({ error: 'HighLevel is not connected' });
-      return;
-    }
+      const users = db.collection('users').withConverter(zodConverter(UserDocSchema));
+      const user = await users.doc(uid).get();
+      const hl = user.data()?.hl;
+      if (!hl?.connected || !hl.locationId) {
+        throw new AppError('CONFLICT', 'HighLevel is not connected');
+      }
 
-    res.json(mintPreviewJwt({ uid, locationId: hl.locationId }));
+      res.json(mintPreviewJwt({ uid, locationId: hl.locationId }));
+    } catch (err) {
+      sendError(res, err);
+    }
   },
 );
 
@@ -116,12 +122,18 @@ export const hlProxy = onRequest(
       return;
     }
 
+    try {
+      await handleProxyRequest(req, res);
+    } catch (err) {
+      sendError(res, err);
+    }
+  },
+);
+
+async function handleProxyRequest(req: Request, res: Response): Promise<void> {
     // --- Authenticate: preview capability token, else Firebase ID token. ---
     const raw = bearerToken(req);
-    if (!raw) {
-      res.status(401).json({ error: 'Missing bearer token' });
-      return;
-    }
+    if (!raw) throw new AppError('UNAUTHORIZED', 'Missing bearer token');
 
     let uid: string;
     let tokenLocationId: string | null = null;
@@ -133,8 +145,7 @@ export const hlProxy = onRequest(
       try {
         ({ uid } = await requireFirebaseUser(req));
       } catch {
-        res.status(401).json({ error: 'Invalid token' });
-        return;
+        throw new AppError('UNAUTHORIZED', 'Invalid token');
       }
     }
 
@@ -142,14 +153,11 @@ export const hlProxy = onRequest(
 
     // --- Resolve the caller's location (from the token, never the request). ---
     if (tokenLocationId === null) {
-      const user = await db.collection('users').doc(uid).get();
-      const hl = user.data()?.hl as { locationId?: string } | undefined;
-      tokenLocationId = hl?.locationId ?? null;
+      const users = db.collection('users').withConverter(zodConverter(UserDocSchema));
+      const user = await users.doc(uid).get();
+      tokenLocationId = user.data()?.hl?.locationId ?? null;
     }
-    if (!tokenLocationId) {
-      res.status(409).json({ error: 'HighLevel is not connected' });
-      return;
-    }
+    if (!tokenLocationId) throw new AppError('CONFLICT', 'HighLevel is not connected');
 
     // --- Genesis-internal route: live HL webhook events for this location. ---
     // Not forwarded to HL — served from Firestore (written by the hlWebhook
@@ -163,24 +171,22 @@ export const hlProxy = onRequest(
     // --- Allowlist gate (before any token work). ---
     const rule = matchRule(req.method, hlPath);
     if (!rule) {
-      res.status(403).json({
-        error: `Endpoint not allowed: ${req.method} ${hlPath}`,
+      throw new AppError('FORBIDDEN', `Endpoint not allowed: ${req.method} ${hlPath}`, {
         hint: 'The Genesis proxy exposes a fixed allowlist of HighLevel endpoints.',
       });
-      return;
     }
 
     // Side-effecting endpoints (send message, write contact) are quota'd: the
     // preview runs UNTRUSTED generated code, and these actions reach real
     // customers. 15/min per user bounds the blast radius of a bad generation.
     if (hasSideEffects(req.method, hlPath)) {
-      const rl = await checkRateLimit(uid, 'hl-write', 15, 60_000);
+      const rl = await checkRateLimit(uid, 'hl-write', RATE_WINDOWS.hlWrite.limit, RATE_WINDOWS.hlWrite.windowMs);
       if (!rl.allowed) {
-        res.status(429).json({
-          error: 'Write limit reached (15/min). Slow down and try again shortly.',
-          retryAfterSeconds: Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000)),
-        });
-        return;
+        throw new AppError(
+          'RATE_LIMITED',
+          `Write limit reached (${RATE_WINDOWS.hlWrite.limit}/min). Slow down and try again shortly.`,
+          { retryAfterSeconds: Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 1000)) },
+        );
       }
     }
 
@@ -197,8 +203,7 @@ export const hlProxy = onRequest(
         ? (req.body as Record<string, unknown>).locationId
         : undefined);
     if (sentLocation !== undefined && sentLocation !== tokenLocationId) {
-      res.status(403).json({ error: 'locationId mismatch' });
-      return;
+      throw new AppError('FORBIDDEN', 'locationId mismatch');
     }
 
     let body: Record<string, unknown> | undefined;
@@ -219,10 +224,8 @@ export const hlProxy = onRequest(
       res.status(out.status).json(out.body);
     } catch (err) {
       if (err instanceof HlAuthError) {
-        res.status(502).json({ error: 'HighLevel auth failed', detail: err.message });
-      } else {
-        res.status(502).json({ error: 'HighLevel request failed', detail: String(err) });
+        throw new AppError('HL_UPSTREAM', 'HighLevel auth failed', { detail: err.message });
       }
+      throw new AppError('HL_UPSTREAM', 'HighLevel request failed');
     }
-  },
-);
+}

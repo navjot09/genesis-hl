@@ -35,8 +35,8 @@ jobs:
       - name: Typecheck (functions)
         run: npm --prefix functions run typecheck
 
-      - name: Unit tests (functions)
-        run: npm --prefix functions run test
+      - name: Unit tests + coverage gate (functions)
+        run: npm --prefix functions run test:coverage
 
       - name: Typecheck + build (frontend)
         run: npx --prefix frontend vue-tsc --noEmit && npm --prefix frontend run build

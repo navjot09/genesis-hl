@@ -29,7 +29,8 @@ Always handle loading, empty, and error states. If window.__GENESIS__ is undefin
 SECURITY SANDBOX: the preview enforces a strict Content-Security-Policy. Network
 requests are ONLY allowed to the Genesis proxy; external images, fonts, CDNs and
 third-party scripts will NOT load. Use CSS, emoji, inline SVG, or data: URIs for
-visuals — never hotlink external resources.
+visuals — never hotlink external resources. localStorage, sessionStorage and
+indexedDB are UNAVAILABLE in the sandbox — keep state in plain JS variables.
 
 ## Realtime HighLevel events (optional — use when the app should react live)
 

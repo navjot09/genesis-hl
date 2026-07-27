@@ -1,13 +1,6 @@
 <script setup lang="ts">
-import { computed, inject, onUnmounted, reactive, ref, watch } from 'vue'
-import {
-  collection,
-  doc,
-  onSnapshot,
-  serverTimestamp,
-  updateDoc,
-  type Unsubscribe,
-} from 'firebase/firestore'
+import { computed, inject, reactive, ref, watch } from 'vue'
+import { doc, serverTimestamp, updateDoc } from 'firebase/firestore'
 import type { editor } from 'monaco-editor'
 import { VueMonacoEditor, DiffEditor as VueMonacoDiffEditor } from '@guolao/vue-monaco-editor'
 import {
@@ -23,6 +16,7 @@ import {
 import { toast } from 'vue-sonner'
 import { db } from '@/lib/firebase'
 import { languageForPath } from '@/lib/language'
+import { useProjectStore } from '@/stores/project'
 import { GenerationKey } from '@/composables/useGeneration'
 import { useSnapshotDiff } from '@/composables/useSnapshotDiff'
 import { Button } from '@/components/ui/button'
@@ -45,64 +39,33 @@ void import('@/lib/monaco').then(() => {
 
 const isGenerating = computed(() => generation.generating.value)
 
-// --- Committed files (idle mode) from Firestore ---------------------------
-interface CommittedFile {
-  docId: string
-  content: string
-}
-const committed = reactive<Record<string, CommittedFile>>({})
-const committedPaths = ref<string[]>([])
-const committedLoading = ref(true)
+// --- Committed files: read from the shared project store -------------------
+// (ONE Firestore subscription lives in the store; this panel is a reader.)
+const store = useProjectStore()
+const committed = computed(() => store.files)
+const committedPaths = computed(() => store.filePaths)
+const committedLoading = computed(() => store.filesLoading)
 // Local editable buffers (idle), keyed by path — compared against committed for dirty state.
 const drafts = reactive<Record<string, string>>({})
 
-let unsub: Unsubscribe | null = null
-
+// Keep each draft in sync with the saved content while it is UNTOUCHED (no
+// unsaved edits); drop drafts for deleted files. The store replaces `files`
+// wholesale per snapshot, so old/new here are distinct objects.
 watch(
-  () => props.projectId,
-  (id) => {
-    unsub?.()
-    unsub = null
-    for (const k of Object.keys(committed)) delete committed[k]
-    for (const k of Object.keys(drafts)) delete drafts[k]
-    committedPaths.value = []
-    committedLoading.value = true
-
-    unsub = onSnapshot(
-      collection(db, 'projects', id, 'files'),
-      (snap) => {
-        const seen = new Set<string>()
-        for (const d of snap.docs) {
-          const data = d.data()
-          const path = data.path as string
-          if (!path) continue
-          const content = (data.content as string) ?? ''
-          seen.add(path)
-          const prev = committed[path]
-          committed[path] = { docId: d.id, content }
-          // Keep the draft in sync while it is untouched (no unsaved edits).
-          if (drafts[path] === undefined || (prev && drafts[path] === prev.content)) {
-            drafts[path] = content
-          }
-        }
-        for (const p of Object.keys(committed)) {
-          if (!seen.has(p)) {
-            delete committed[p]
-            delete drafts[p]
-          }
-        }
-        committedPaths.value = Object.keys(committed).sort()
-        committedLoading.value = false
-      },
-      () => {
-        committedLoading.value = false
-      },
-    )
+  () => store.files,
+  (next, prev) => {
+    for (const [path, f] of Object.entries(next)) {
+      const before = prev?.[path]
+      if (drafts[path] === undefined || (before && drafts[path] === before.content)) {
+        drafts[path] = f.content
+      }
+    }
+    for (const p of Object.keys(drafts)) {
+      if (!(p in next)) delete drafts[p]
+    }
   },
   { immediate: true },
 )
-
-onUnmounted(() => unsub?.())
 
 // --- Tabs / active file (unified across idle + generating) -----------------
 // One source of truth for tabs + active file. Generation ADDS to these and
@@ -185,12 +148,12 @@ const editorValue = computed<string>({
       const gf = generation.files[p]
       // An EDIT streams raw SEARCH/REPLACE hunks, not file content — keep showing
       // the current saved file; the patched result loads on commit.
-      if (gf && gf.op === 'edit') return committed[p]?.content ?? ''
+      if (gf && gf.op === 'edit') return committed.value[p]?.content ?? ''
       // A file being (re)written shows its live stream; an untouched committed
       // file shows its saved content (read-only).
-      return gf?.content ?? committed[p]?.content ?? ''
+      return gf?.content ?? committed.value[p]?.content ?? ''
     }
-    return drafts[p] ?? committed[p]?.content ?? ''
+    return drafts[p] ?? committed.value[p]?.content ?? ''
   },
   set(val: string) {
     const p = activePath.value
@@ -227,7 +190,7 @@ watch(isGenerating, (g) => editorInstance?.updateOptions({ readOnly: g }))
 // --- Dirty state + save ----------------------------------------------------
 function isDirty(path: string): boolean {
   if (isGenerating.value) return false
-  const c = committed[path]
+  const c = committed.value[path]
   return !!c && drafts[path] !== undefined && drafts[path] !== c.content
 }
 const activeDirty = computed(() => (activePath.value ? isDirty(activePath.value) : false))
@@ -236,7 +199,7 @@ const savingPath = ref<string | null>(null)
 
 async function save(path: string | null): Promise<void> {
   if (!path) return
-  const c = committed[path]
+  const c = committed.value[path]
   if (!c || savingPath.value) return
   savingPath.value = path
   try {
@@ -244,7 +207,6 @@ async function save(path: string | null): Promise<void> {
       content: drafts[path],
       updatedAt: serverTimestamp(),
     })
-    committed[path].content = drafts[path]
     toast.success('File saved', { description: path })
   } catch (err) {
     toast.error('Could not save file', {
@@ -281,7 +243,7 @@ const diffOriginal = computed(() => (activePath.value ? diff.baseFor(activePath.
 const diffModified = computed(() => {
   const p = activePath.value
   if (!p) return ''
-  return drafts[p] ?? committed[p]?.content ?? ''
+  return drafts[p] ?? committed.value[p]?.content ?? ''
 })
 const activeChanged = computed(() => (activePath.value ? diff.didChange(activePath.value) : false))
 const canDiff = computed(() => diff.hasParent.value && diff.changedPaths.value.size > 0)

@@ -19,6 +19,8 @@ export { generate } from './generate/index.js';
 export { restoreSnapshot } from './generate/restore.js';
 // HighLevel webhook receiver — stores events for generated apps to react to
 export { hlWebhook } from './webhooks/index.js';
+// Scheduled hygiene: mark generation jobs whose instance died as failed
+export { sweepStaleGenerations } from './jobs/sweeper.js';
 
 /** Simple liveness probe. */
 export const health = onRequest({ cors: true }, (_req, res) => {

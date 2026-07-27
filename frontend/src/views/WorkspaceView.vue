@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { onUnmounted, provide, reactive, ref, watch } from 'vue'
+import { computed, onUnmounted, provide, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { doc, onSnapshot, type Timestamp, type Unsubscribe } from 'firebase/firestore'
 import {
   ArrowLeftIcon,
   CameraIcon,
@@ -11,8 +10,8 @@ import {
   SparklesIcon,
 } from '@lucide/vue'
 import { toast } from 'vue-sonner'
-import { db } from '@/lib/firebase'
 import { cn } from '@/lib/utils'
+import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
 import { useGeneration, GenerationKey } from '@/composables/useGeneration'
 import { Button } from '@/components/ui/button'
@@ -60,42 +59,42 @@ const authStore = useAuthStore()
 
 const projectId = route.params.id as string
 
+// ONE store instance owns every realtime subscription for this project;
+// panels (chat/editor/preview) are pure readers of it.
+const store = useProjectStore()
+store.bind(projectId)
+onUnmounted(() => store.unbind())
+
 // ONE generation instance for the whole workspace, shared with ChatPanel
 // (triggers generate) and EditorPanel (renders the streamed files) via inject.
 const generation = useGeneration(projectId)
 provide(GenerationKey, generation)
 
-interface ProjectDoc {
-  name: string
-  description: string
-  ownerUid: string
-  deletedAt: Timestamp | null
-}
-
-const project = ref<ProjectDoc | null>(null)
-const loading = ref(true)
-
-let unsub: Unsubscribe | null = null
+const project = computed(() => store.project)
+const loading = computed(() => store.projectLoading)
 
 // Guard: the doc must exist, be owned by the current user, and not be deleted.
-unsub = onSnapshot(
-  doc(db, 'projects', projectId),
-  (snap) => {
-    loading.value = false
-    if (!snap.exists()) {
+watch(
+  [loading, project, () => store.projectMissing],
+  () => {
+    if (loading.value) return
+    if (store.projectMissing || !project.value) {
       redirectHome('This project no longer exists.')
       return
     }
-    const data = snap.data() as ProjectDoc
-    if (data.ownerUid !== authStore.user?.uid || data.deletedAt != null) {
+    if (project.value.ownerUid !== authStore.user?.uid || project.value.deletedAt != null) {
       redirectHome('You do not have access to this project.')
-      return
     }
-    project.value = data
   },
-  () => {
-    loading.value = false
-    redirectHome('Could not load this project.')
+  { immediate: true },
+)
+
+// Surface realtime-listener failures once — otherwise panels silently show
+// empty data with no explanation.
+watch(
+  () => store.listenerError,
+  (msg) => {
+    if (msg) toast.error(msg, { description: 'Check your connection and reload the page.' })
   },
 )
 
@@ -103,8 +102,6 @@ function redirectHome(message: string): void {
   toast.error(message)
   void router.replace({ name: 'dashboard' })
 }
-
-onUnmounted(() => unsub?.())
 
 // If auth is lost while here, bail out.
 watch(

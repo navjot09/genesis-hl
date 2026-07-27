@@ -9,6 +9,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // Shared backend/frontend wire contracts — single source of truth.
+      '@contracts': path.resolve(__dirname, '../functions/src/shared/contracts.ts'),
     },
   },
 })

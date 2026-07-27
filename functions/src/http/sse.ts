@@ -19,18 +19,12 @@
  */
 import type { Response } from 'express';
 
-export type SseEvent =
-  | 'assistant_delta'
-  | 'file_open'
-  | 'file_delta'
-  | 'file_close'
-  | 'snapshot'
-  | 'done'
-  | 'error';
+export type { SseEvent } from '../shared/contracts.js';
+import type { SseEvent } from '../shared/contracts.js';
 
 export interface SseController {
-  /** Emit a named event with a JSON payload. */
-  send(event: SseEvent, data: unknown): void;
+  /** Emit a typed event — name + payload travel together. */
+  send(event: SseEvent): void;
   /** Emit an SSE comment (used for heartbeats / keep-alive). */
   comment(text: string): void;
   /** Whether the client has disconnected. */
@@ -66,8 +60,9 @@ export function startSse(res: Response, req?: { on(ev: 'close', cb: () => void):
   const heartbeat = setInterval(() => raw(': ping\n\n'), 15000);
 
   return {
-    send(event, data) {
-      raw(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    send(event) {
+      const { type, ...data } = event;
+      raw(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
     },
     comment(text) {
       raw(`: ${text}\n\n`);

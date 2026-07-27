@@ -1,82 +1,26 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
-import {
-  collection,
-  limitToLast,
-  onSnapshot,
-  orderBy,
-  query,
-  type Timestamp,
-  type Unsubscribe,
-} from 'firebase/firestore'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { BotIcon, MessageSquareIcon, SendIcon, SquareIcon, UserIcon } from '@lucide/vue'
-import { db } from '@/lib/firebase'
 import { GenerationKey } from '@/composables/useGeneration'
 import { renderMarkdown } from '@/lib/markdown'
-import type { FileChange } from '@/lib/diffTypes'
+import { useProjectStore } from '@/stores/project'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import DiffCard from '@/components/workspace/DiffCard.vue'
 
-const props = defineProps<{ projectId: string }>()
+defineProps<{ projectId: string }>()
 
 const injected = inject(GenerationKey)
 if (!injected) throw new Error('ChatPanel must be used inside a workspace that provides generation state')
 const generation = injected
 
-interface ChatMessage {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  changes: FileChange[]
-  createdAt: Timestamp | null
-}
-
-const messages = ref<ChatMessage[]>([])
-const loading = ref(true)
+// Messages come from the shared project store (single subscription).
+const store = useProjectStore()
+const messages = computed(() => store.messages)
+const loading = computed(() => store.messagesLoading)
 // Optimistic echo of the just-sent prompt, cleared once the backend-written
 // copy arrives via the subscription (deduped by content) or on completion.
 const pendingUser = ref<string | null>(null)
-
-let unsub: Unsubscribe | null = null
-
-watch(
-  () => props.projectId,
-  (id) => {
-    unsub?.()
-    unsub = null
-    messages.value = []
-    loading.value = true
-    const q = query(
-      collection(db, 'projects', id, 'messages'),
-      orderBy('createdAt', 'asc'),
-      // Bounded: chat renders the recent conversation, not unbounded history.
-      limitToLast(200),
-    )
-    unsub = onSnapshot(
-      q,
-      (snap) => {
-        messages.value = snap.docs.map((d) => {
-          const data = d.data()
-          return {
-            id: d.id,
-            role: data.role === 'assistant' ? 'assistant' : 'user',
-            content: (data.content as string) ?? '',
-            changes: Array.isArray(data.changes) ? (data.changes as FileChange[]) : [],
-            createdAt: (data.createdAt as Timestamp | null) ?? null,
-          }
-        })
-        loading.value = false
-      },
-      () => {
-        loading.value = false
-      },
-    )
-  },
-  { immediate: true },
-)
-
-onUnmounted(() => unsub?.())
 
 // Show the optimistic bubble only until the real user message lands.
 const showOptimistic = computed(

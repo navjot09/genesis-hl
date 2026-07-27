@@ -7,10 +7,14 @@
 import { z } from 'zod';
 import type { ParsedFile } from './markerParser.js';
 import { applyEditBlocks, parseEditBlocks } from './editApply.js';
+import { LIMITS } from '../config/limits.js';
 
-const MAX_FILE_BYTES = 200_000;
-const MAX_TOTAL_BYTES = 1_500_000;
-const MAX_FILES = 40;
+const MAX_FILE_BYTES = LIMITS.maxFileBytes;
+const MAX_TOTAL_BYTES = LIMITS.maxTotalBytes;
+const MAX_FILES = LIMITS.maxFiles;
+
+/** Generated apps are static web files — anything else is rejected outright. */
+const ALLOWED_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'mjs', 'json', 'svg', 'md', 'txt']);
 
 const FileOpSchema = z.object({
   path: z
@@ -21,7 +25,16 @@ const FileOpSchema = z.object({
     .refine((p) => !p.includes('..'), 'path must not contain ".."')
     .refine((p) => !/^[a-zA-Z]:/.test(p), 'no drive-letter paths')
     .refine((p) => !p.includes('\0'), 'no null bytes')
-    .refine((p) => /^[A-Za-z0-9._\-/]+$/.test(p), 'path has invalid characters'),
+    .refine((p) => /^[A-Za-z0-9._\-/]+$/.test(p), 'path has invalid characters')
+    .refine(
+      (p) => p.split('/').every((seg) => seg.length > 0 && !seg.startsWith('.')),
+      'dotfiles and empty path segments are not allowed',
+    )
+    .refine((p) => {
+      const seg = p.split('/').pop() ?? '';
+      const ext = seg.includes('.') ? seg.split('.').pop()!.toLowerCase() : '';
+      return ALLOWED_EXTENSIONS.has(ext);
+    }, 'file type not allowed (static web files only)'),
   op: z.enum(['write', 'edit', 'delete']),
   content: z.string().max(MAX_FILE_BYTES),
 });
